@@ -23,6 +23,7 @@ Notes:
       user id + a timestamp, so nothing gets overwritten.
 """
 
+import base64
 import logging
 import os
 import re
@@ -52,6 +53,22 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# Cookies (needed to download age-restricted / login-required content, e.g.
+# some Instagram Reels). If COOKIES_B64 is set (a base64-encoded cookies.txt,
+# exported from a logged-in browser session), decode it to a local file that
+# yt-dlp can use.
+# --------------------------------------------------------------------------- #
+
+COOKIES_FILE = Path(__file__).parent / "cookies.txt"
+_cookies_b64 = os.environ.get("COOKIES_B64")
+if _cookies_b64:
+    try:
+        COOKIES_FILE.write_bytes(base64.b64decode(_cookies_b64))
+        logger.info("Loaded cookies.txt from COOKIES_B64 environment variable.")
+    except Exception:
+        logger.exception("Failed to decode COOKIES_B64; continuing without cookies.")
 
 
 # --------------------------------------------------------------------------- #
@@ -108,6 +125,9 @@ def download_video(url: str, user_id: int) -> Path:
         "quiet": True,
         "no_warnings": True,
     }
+
+    if COOKIES_FILE.exists():
+        ydl_opts["cookiefile"] = str(COOKIES_FILE)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
