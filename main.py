@@ -119,12 +119,12 @@ def download_video(url: str, user_id: int) -> Path:
 
     ydl_opts = {
         "outtmpl": outtmpl,
-        # Prefer the best single file that DOES have an audio track (Instagram
-        # sometimes serves a higher-bitrate video-only preview stream that
-        # "best" would otherwise pick, resulting in a silent download).
-        # Falls back to merging separate best video+audio streams, and only
-        # as a last resort accepts literally anything.
-        "format": "best[acodec!=none]/bestvideo*+bestaudio/best",
+        # Instagram often only exposes separate video-only (DASH) and
+        # audio-only streams, with no single file that has both. Prioritize
+        # explicitly merging best video + best audio (guarantees sound via
+        # ffmpeg). Only fall back to a single "best" file if merging isn't
+        # possible, and prefer one with a known audio codec over "unknown".
+        "format": "bestvideo+bestaudio/best[acodec!=none]/best",
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
