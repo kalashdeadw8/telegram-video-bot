@@ -1,52 +1,74 @@
 """
-Telegram Video-Saver Bot
--------------------------
-Send this bot a link to a video (YouTube, TikTok, Twitter/X, Instagram,
-Reddit, and hundreds of other sites supported by yt-dlp) and it will
-download the video to the server's `downloads/` folder and send a copy
-back to you in the chat.
+Telegram-бот для сохранения видео по ссылке
+--------------------------------------------
+Отправьте боту ссылку на видео (YouTube, TikTok, Twitter/X, Instagram,
+Reddit и сотни других сайтов, поддерживаемых yt-dlp) — он скачает видео
+на сервер в папку `downloads/` и пришлёт копию вам в чат.
 
-Setup:
+Если у видео нет доступной версии со звуком (частое ограничение
+некоторых Instagram Reels), бот сначала спросит подтверждение, прежде
+чем скачивать немую версию.
+
+Настройка:
     1. pip install -r requirements.txt
-    2. Create a bot with @BotFather on Telegram, copy the token.
-    3. Set the token as an environment variable:
-           export TELEGRAM_BOT_TOKEN="123456:ABC-your-token-here"
-    4. Run:
-           python bot.py
+    2. Создайте бота через @BotFather в Telegram, скопируйте токен.
+    3. Задайте токен как переменную окружения:
+           export TELEGRAM_BOT_TOKEN="123456:ABC-ваш-токен"
+    4. Запуск:
+           python main.py
 
-Notes:
-    - Telegram bots can only SEND files up to 50 MB back to a chat
-      (this is a Telegram Bot API limit, not something this code can
-      change). Larger videos are still saved to disk in DOWNLOAD_DIR,
-      the user is just told it's too big to send back.
-    - Videos are saved locally in DOWNLOAD_DIR, named by the Telegram
-      user id + a timestamp, so nothing gets overwritten.
+Примечания:
+    - Telegram-боты могут ОТПРАВЛЯТЬ файлы обратно в чат размером не
+      более 50 МБ (это ограничение самого Telegram Bot API, а не кода).
+      Более крупные видео всё равно сохраняются на сервере в
+      DOWNLOAD_DIR, пользователю просто сообщается, что файл слишком
+      большой для отправки.
+    - Видео сохраняются локально в DOWNLOAD_DIR с именем на основе
+      Telegram user id и метки времени, поэтому файлы не перезаписывают
+      друг друга.
 """
 
 import base64
 import logging
 import os
 import re
+import uuid
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
 load_dotenv()
 import yt_dlp
-from telegram import Update
-from telegram.ext import Application, ContextTypes, MessageHandler, filters, CommandHandler
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 # --------------------------------------------------------------------------- #
-# Configuration
+# Конфигурация
 # --------------------------------------------------------------------------- #
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 DOWNLOAD_DIR = Path(__file__).parent / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-TELEGRAM_SEND_LIMIT_BYTES = 50 * 1024 * 1024  # 50 MB Bot API upload limit
+TELEGRAM_SEND_LIMIT_BYTES = 50 * 1024 * 1024  # лимит Bot API на отправку файла
 
 URL_REGEX = re.compile(r"https?://\S+")
+
+# Формат: сначала явно пытаемся склеить видео (vp09/avc1) с лучшим аудио —
+# так гарантируется звук, если он вообще доступен у источника. "unknown"-
+# форматы намеренно в самом конце, чтобы не подменяли собой немое видео.
+YDL_FORMAT = (
+    "bestvideo[vcodec^=vp]+bestaudio/"
+    "bestvideo[vcodec^=avc]+bestaudio/"
+    "best[acodec!=none][vcodec!=none]/best"
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -55,10 +77,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
-# Cookies (needed to download age-restricted / login-required content, e.g.
-# some Instagram Reels). If COOKIES_B64 is set (a base64-encoded cookies.txt,
-# exported from a logged-in browser session), decode it to a local file that
-# yt-dlp can use.
+# Cookies (нужны для скачивания возрастного/приватного контента, например
+# некоторых Instagram Reels). Если задана переменная COOKIES_B64 (base64
+# от cookies.txt, экспортированного из залогиненного браузера), декодируем
+# её в локальный файл, который использует yt-dlp.
 # --------------------------------------------------------------------------- #
 
 COOKIES_FILE = Path(__file__).parent / "cookies.txt"
@@ -66,19 +88,82 @@ _cookies_b64 = os.environ.get("COOKIES_B64")
 if _cookies_b64:
     try:
         COOKIES_FILE.write_bytes(base64.b64decode(_cookies_b64))
-        logger.info("Loaded cookies.txt from COOKIES_B64 environment variable.")
+        logger.info("Cookies.txt загружен из переменной окружения COOKIES_B64.")
     except Exception:
-        logger.exception("Failed to decode COOKIES_B64; continuing without cookies.")
+        logger.exception("Не удалось декодировать COOKIES_B64; продолжаю без cookies.")
+
+# В памяти храним ссылки, ожидающие подтверждения пользователя (когда видео
+# доступно только без звука). Ключ — короткий случайный id для callback_data.
+PENDING_DOWNLOADS: dict[str, str] = {}
+
+
+def build_ydl_opts(outtmpl: str | None = None) -> dict:
+    """Собрать общие опции yt-dlp (формат, cookies, прокси)."""
+    opts: dict = {
+        "format": YDL_FORMAT,
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+    if outtmpl:
+        opts["outtmpl"] = outtmpl
+
+    if COOKIES_FILE.exists():
+        opts["cookiefile"] = str(COOKIES_FILE)
+
+    # Опциональный прокси (например, резидентный), если запросы с IP
+    # хостинга получают урезанный ответ от источника. Задаётся через
+    # переменную YTDLP_PROXY в формате: http://логин:пароль@адрес:порт
+    proxy = os.environ.get("YTDLP_PROXY")
+    if proxy:
+        opts["proxy"] = proxy
+
+    return opts
+
+
+def probe_has_audio(url: str) -> bool:
+    """Проверить (без скачивания видео), будет ли у итогового файла звук."""
+    ydl_opts = build_ydl_opts()
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    return _info_has_audio(info)
+
+
+def _info_has_audio(info: dict) -> bool:
+    requested = info.get("requested_downloads") or info.get("requested_formats") or [info]
+    if len(requested) == 1 and requested[0].get("acodec") in (None, "none"):
+        return False
+    return True
+
+
+def download_video(url: str, user_id: int) -> tuple[Path, bool]:
+    """Скачать `url` через yt-dlp.
+
+    Возвращает (путь_к_файлу, has_audio). has_audio может оказаться False,
+    даже если предварительная проверка обещала звук, — источник иногда
+    отдаёт разные варианты между запросами.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    outtmpl = str(DOWNLOAD_DIR / f"{user_id}_{timestamp}_%(title).50s.%(ext)s")
+
+    ydl_opts = build_ydl_opts(outtmpl)
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+
+    return Path(filename), _info_has_audio(info)
 
 
 # --------------------------------------------------------------------------- #
-# Handlers
+# Обработчики
 # --------------------------------------------------------------------------- #
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "👋 Send me a link to a video (YouTube, TikTok, Twitter/X, "
-        "Instagram, Reddit, etc.) and I'll download and save it for you."
+        "👋 Пришлите мне ссылку на видео (YouTube, TikTok, Twitter/X, "
+        "Instagram, Reddit и т.д.), и я скачаю и сохраню его для вас."
     )
 
 
@@ -87,108 +172,114 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     match = URL_REGEX.search(text)
 
     if not match:
-        await update.message.reply_text("Please send me a valid link to a video.")
+        await update.message.reply_text("Пришлите, пожалуйста, корректную ссылку на видео.")
         return
 
     url = match.group(0)
-    status_msg = await update.message.reply_text("⏳ Downloading your video...")
+    status_msg = await update.message.reply_text("🔍 Проверяю видео...")
 
     try:
-        filepath, has_audio = download_video(url, update.effective_user.id)
-    except Exception as exc:  # noqa: BLE001 - report any download failure to the user
-        logger.exception("Download failed for %s", url)
-        await status_msg.edit_text(f"❌ Couldn't download that video.\nReason: {exc}")
+        has_audio = probe_has_audio(url)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Не удалось проверить ссылку %s", url)
+        await status_msg.edit_text(f"❌ Не удалось обработать ссылку.\nПричина: {exc}")
+        return
+
+    if has_audio:
+        await status_msg.edit_text("⏳ Скачиваю видео...")
+        await run_download_and_send(status_msg, url, update.effective_user.id)
+        return
+
+    # Звука нет — спрашиваем подтверждение через кнопки
+    callback_id = uuid.uuid4().hex[:12]
+    PENDING_DOWNLOADS[callback_id] = url
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Да, скачать без звука", callback_data=f"dl_yes:{callback_id}"),
+                InlineKeyboardButton("❌ Отмена", callback_data=f"dl_no:{callback_id}"),
+            ]
+        ]
+    )
+    await status_msg.edit_text(
+        "🔇 У этого видео нет доступной версии со звуком — такое ограничение "
+        "стоит на стороне источника (например, из-за защищённой музыки в "
+        "Instagram Reels).\n\nВсё равно скачать видео без звука?",
+        reply_markup=keyboard,
+    )
+
+
+async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    action, _, callback_id = query.data.partition(":")
+    url = PENDING_DOWNLOADS.pop(callback_id, None)
+
+    if url is None:
+        await query.edit_message_text(
+            "⚠️ Это действие уже неактуально. Пришлите ссылку ещё раз."
+        )
+        return
+
+    if action == "dl_no":
+        await query.edit_message_text("Отменено. Можете прислать другую ссылку.")
+        return
+
+    await query.edit_message_text("⏳ Скачиваю видео...")
+    await run_download_and_send(query.message, url, query.from_user.id)
+
+
+async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> None:
+    """Скачать видео и отправить его в чат, обновляя статусное сообщение."""
+    try:
+        filepath, has_audio = download_video(url, user_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Не удалось скачать %s", url)
+        await status_msg.edit_text(f"❌ Не удалось скачать это видео.\nПричина: {exc}")
         return
 
     size = filepath.stat().st_size
-    await status_msg.edit_text(f"✅ Saved: {filepath.name} ({size / 1_048_576:.1f} MB)")
+    await status_msg.edit_text(f"✅ Сохранено: {filepath.name} ({size / 1_048_576:.1f} МБ)")
 
     if size <= TELEGRAM_SEND_LIMIT_BYTES:
         caption = None if has_audio else (
-            "🔇 Heads up: this one downloaded without audio. The source site "
-            "didn't offer a version with sound for this content."
+            "🔇 Учтите: это видео скачалось без звука — у источника не "
+            "было доступной версии со звуком для этого контента."
         )
-        await update.message.reply_video(video=filepath.open("rb"), caption=caption)
+        with filepath.open("rb") as video_file:
+            await status_msg.get_bot().send_video(
+                chat_id=status_msg.chat_id, video=video_file, caption=caption
+            )
     else:
-        await update.message.reply_text(
-            "⚠️ The video is larger than Telegram's 50 MB bot upload limit, "
-            "so I saved it on the server but can't send it back in chat."
+        await status_msg.get_bot().send_message(
+            chat_id=status_msg.chat_id,
+            text=(
+                "⚠️ Видео больше лимита Telegram на отправку файлов ботом "
+                "(50 МБ), поэтому я сохранил его на сервере, но не могу "
+                "прислать сюда в чат."
+            ),
         )
-
-
-def download_video(url: str, user_id: int) -> tuple[Path, bool]:
-    """Download `url` with yt-dlp.
-
-    Returns (path_to_file, has_audio). `has_audio` is False when the source
-    site only offered a video-only stream for this content (a known
-    Instagram behavior for some posts, especially from datacenter IPs).
-    """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    outtmpl = str(DOWNLOAD_DIR / f"{user_id}_{timestamp}_%(title).50s.%(ext)s")
-
-    ydl_opts = {
-        "outtmpl": outtmpl,
-        # Instagram's format list mixes real DASH video-only/audio-only
-        # streams with legacy formats whose codec info is reported as the
-        # literal string "unknown" (not "none"), which can slip past a
-        # naive acodec!=none filter and result in a silent video. Force
-        # picking an actual DASH video stream (vp09/avc1) to merge with the
-        # best audio stream, which guarantees sound via ffmpeg when an
-        # audio stream is actually available from the source.
-        "format": (
-            "bestvideo[vcodec^=vp]+bestaudio/"
-            "bestvideo[vcodec^=avc]+bestaudio/"
-            "best[acodec!=none][vcodec!=none]/best"
-        ),
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-    }
-
-    if COOKIES_FILE.exists():
-        ydl_opts["cookiefile"] = str(COOKIES_FILE)
-
-    # Optional proxy (e.g. a residential proxy) to route requests through,
-    # in case the hosting provider's datacenter IP gets a degraded response
-    # from the source site. Set YTDLP_PROXY to something like:
-    #   http://username:password@proxy-host:port
-    proxy = os.environ.get("YTDLP_PROXY")
-    if proxy:
-        ydl_opts["proxy"] = proxy
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-
-    # Figure out whether the final file actually has an audio track. When
-    # yt-dlp merges two formats, `requested_downloads` lists each one; when
-    # it only got a single (video-only) stream, that list has one entry
-    # whose acodec is "none".
-    has_audio = True
-    requested = info.get("requested_downloads") or [info]
-    if len(requested) == 1 and requested[0].get("acodec") in (None, "none"):
-        has_audio = False
-
-    return Path(filename), has_audio
 
 
 # --------------------------------------------------------------------------- #
-# Entry point
+# Точка входа
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit(
-            "Missing TELEGRAM_BOT_TOKEN environment variable. "
-            "Get a token from @BotFather and set it before running."
+            "Отсутствует переменная окружения TELEGRAM_BOT_TOKEN. "
+            "Получите токен у @BotFather и задайте его перед запуском."
         )
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(handle_confirmation, pattern=r"^dl_(yes|no):"))
 
-    logger.info("Bot starting...")
+    logger.info("Бот запускается...")
     app.run_polling()
 
 
