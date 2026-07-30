@@ -119,7 +119,10 @@ def download_video(url: str, user_id: int) -> Path:
 
     ydl_opts = {
         "outtmpl": outtmpl,
-        "format": "mp4/bestvideo+bestaudio/best",
+        # Prefer separate best video+audio streams merged together (guarantees
+        # sound). Falls back to a single best combined stream only if the site
+        # doesn't offer separate streams.
+        "format": "bestvideo*+bestaudio/best",
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
