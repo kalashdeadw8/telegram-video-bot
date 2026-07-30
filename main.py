@@ -132,8 +132,9 @@ def download_video(url: str, user_id: int) -> Path:
         ),
         "merge_output_format": "mp4",
         "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
+        "quiet": False,
+        "no_warnings": False,
+        "verbose": True,
     }
 
     if COOKIES_FILE.exists():
