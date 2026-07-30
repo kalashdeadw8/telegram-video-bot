@@ -119,12 +119,17 @@ def download_video(url: str, user_id: int) -> Path:
 
     ydl_opts = {
         "outtmpl": outtmpl,
-        # Instagram often only exposes separate video-only (DASH) and
-        # audio-only streams, with no single file that has both. Prioritize
-        # explicitly merging best video + best audio (guarantees sound via
-        # ffmpeg). Only fall back to a single "best" file if merging isn't
-        # possible, and prefer one with a known audio codec over "unknown".
-        "format": "bestvideo+bestaudio/best[acodec!=none]/best",
+        # Instagram's format list mixes real DASH video-only/audio-only
+        # streams with legacy formats whose codec info is reported as the
+        # literal string "unknown" (not "none"), which can slip past a
+        # naive acodec!=none filter and result in a silent video. Force
+        # picking an actual DASH video stream (vp09/avc1) to merge with the
+        # best audio stream, which guarantees sound via ffmpeg.
+        "format": (
+            "bestvideo[vcodec^=vp]+bestaudio/"
+            "bestvideo[vcodec^=avc]+bestaudio/"
+            "best[acodec!=none][vcodec!=none]/best"
+        ),
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
