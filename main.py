@@ -94,7 +94,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     status_msg = await update.message.reply_text("⏳ Downloading your video...")
 
     try:
-        filepath = download_video(url, update.effective_user.id)
+        filepath, has_audio = download_video(url, update.effective_user.id)
     except Exception as exc:  # noqa: BLE001 - report any download failure to the user
         logger.exception("Download failed for %s", url)
         await status_msg.edit_text(f"❌ Couldn't download that video.\nReason: {exc}")
@@ -104,7 +104,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await status_msg.edit_text(f"✅ Saved: {filepath.name} ({size / 1_048_576:.1f} MB)")
 
     if size <= TELEGRAM_SEND_LIMIT_BYTES:
-        await update.message.reply_video(video=filepath.open("rb"))
+        caption = None if has_audio else (
+            "🔇 Heads up: this one downloaded without audio. The source site "
+            "didn't offer a version with sound for this content."
+        )
+        await update.message.reply_video(video=filepath.open("rb"), caption=caption)
     else:
         await update.message.reply_text(
             "⚠️ The video is larger than Telegram's 50 MB bot upload limit, "
@@ -112,8 +116,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
-def download_video(url: str, user_id: int) -> Path:
-    """Download `url` with yt-dlp and return the path to the saved file."""
+def download_video(url: str, user_id: int) -> tuple[Path, bool]:
+    """Download `url` with yt-dlp.
+
+    Returns (path_to_file, has_audio). `has_audio` is False when the source
+    site only offered a video-only stream for this content (a known
+    Instagram behavior for some posts, especially from datacenter IPs).
+    """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     outtmpl = str(DOWNLOAD_DIR / f"{user_id}_{timestamp}_%(title).50s.%(ext)s")
 
@@ -124,7 +133,8 @@ def download_video(url: str, user_id: int) -> Path:
         # literal string "unknown" (not "none"), which can slip past a
         # naive acodec!=none filter and result in a silent video. Force
         # picking an actual DASH video stream (vp09/avc1) to merge with the
-        # best audio stream, which guarantees sound via ffmpeg.
+        # best audio stream, which guarantees sound via ffmpeg when an
+        # audio stream is actually available from the source.
         "format": (
             "bestvideo[vcodec^=vp]+bestaudio/"
             "bestvideo[vcodec^=avc]+bestaudio/"
@@ -132,19 +142,35 @@ def download_video(url: str, user_id: int) -> Path:
         ),
         "merge_output_format": "mp4",
         "noplaylist": True,
-        "quiet": False,
-        "no_warnings": False,
-        "verbose": True,
+        "quiet": True,
+        "no_warnings": True,
     }
 
     if COOKIES_FILE.exists():
         ydl_opts["cookiefile"] = str(COOKIES_FILE)
 
+    # Optional proxy (e.g. a residential proxy) to route requests through,
+    # in case the hosting provider's datacenter IP gets a degraded response
+    # from the source site. Set YTDLP_PROXY to something like:
+    #   http://username:password@proxy-host:port
+    proxy = os.environ.get("YTDLP_PROXY")
+    if proxy:
+        ydl_opts["proxy"] = proxy
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
 
-    return Path(filename)
+    # Figure out whether the final file actually has an audio track. When
+    # yt-dlp merges two formats, `requested_downloads` lists each one; when
+    # it only got a single (video-only) stream, that list has one entry
+    # whose acodec is "none".
+    has_audio = True
+    requested = info.get("requested_downloads") or [info]
+    if len(requested) == 1 and requested[0].get("acodec") in (None, "none"):
+        has_audio = False
+
+    return Path(filename), has_audio
 
 
 # --------------------------------------------------------------------------- #
