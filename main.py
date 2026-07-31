@@ -99,7 +99,7 @@ if _cookies_b64:
 
 # В памяти храним ссылки, ожидающие подтверждения пользователя (когда видео
 # доступно только без звука). Ключ — короткий случайный id для callback_data.
-PENDING_DOWNLOADS: dict[str, str] = {}
+PENDING_DOWNLOADS: dict[str, dict] = {}
 
 
 def build_ydl_opts(outtmpl: str | None = None) -> dict:
@@ -135,12 +135,13 @@ def build_ydl_opts(outtmpl: str | None = None) -> dict:
     return opts
 
 
-def probe_has_audio(url: str) -> bool:
-    """Проверить (без скачивания видео), будет ли у итогового файла звук."""
+def fetch_info(url: str) -> dict:
+    """Один раз запросить у источника информацию о видео (без скачивания
+    самого медиафайла) — эту же info можно потом передать в download_video,
+    чтобы не делать повторный запрос метаданных."""
     ydl_opts = build_ydl_opts()
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-    return _info_has_audio(info)
+        return ydl.extract_info(url, download=False)
 
 
 def _info_has_audio(info: dict) -> bool:
@@ -199,12 +200,14 @@ def ensure_iphone_compatible(filepath: Path) -> Path:
     return output_path
 
 
-def download_video(url: str, user_id: int) -> tuple[Path, bool]:
-    """Скачать `url` через yt-dlp.
+def download_video(info: dict, user_id: int) -> tuple[Path, bool]:
+    """Скачать медиафайл по уже полученной через fetch_info() информации.
 
-    Возвращает (путь_к_файлу, has_audio). has_audio может оказаться False,
-    даже если предварительная проверка обещала звук, — источник иногда
-    отдаёт разные варианты между запросами.
+    Использует process_ie_result вместо повторного extract_info, чтобы не
+    делать второй запрос метаданных к источнику (это и экономит время, и
+    снижает риск получить 403/ограничение от источника за частые запросы).
+
+    Возвращает (путь_к_файлу, has_audio).
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     outtmpl = str(DOWNLOAD_DIR / f"{user_id}_{timestamp}_%(title).50s.%(ext)s")
@@ -212,12 +215,13 @@ def download_video(url: str, user_id: int) -> tuple[Path, bool]:
     ydl_opts = build_ydl_opts(outtmpl)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
+        result = ydl.process_ie_result(info, download=True)
+        filename = ydl.prepare_filename(result)
 
-    has_audio = _info_has_audio(info)
+    has_audio = _info_has_audio(result)
     filepath = ensure_iphone_compatible(Path(filename))
     return filepath, has_audio
+
 
 
 # --------------------------------------------------------------------------- #
@@ -243,20 +247,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     status_msg = await update.message.reply_text("🔍 Проверяю видео...")
 
     try:
-        has_audio = probe_has_audio(url)
+        info = fetch_info(url)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Не удалось проверить ссылку %s", url)
         await status_msg.edit_text(f"❌ Не удалось обработать ссылку.\nПричина: {exc}")
         return
 
+    has_audio = _info_has_audio(info)
+
     if has_audio:
         await status_msg.edit_text("⏳ Скачиваю видео...")
-        await run_download_and_send(status_msg, url, update.effective_user.id)
+        await run_download_and_send(status_msg, info, update.effective_user.id)
         return
 
     # Звука нет — спрашиваем подтверждение через кнопки
     callback_id = uuid.uuid4().hex[:12]
-    PENDING_DOWNLOADS[callback_id] = url
+    PENDING_DOWNLOADS[callback_id] = info
 
     keyboard = InlineKeyboardMarkup(
         [
@@ -279,9 +285,9 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
     action, _, callback_id = query.data.partition(":")
-    url = PENDING_DOWNLOADS.pop(callback_id, None)
+    info = PENDING_DOWNLOADS.pop(callback_id, None)
 
-    if url is None:
+    if info is None:
         await query.edit_message_text(
             "⚠️ Это действие уже неактуально. Пришлите ссылку ещё раз."
         )
@@ -292,7 +298,7 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     await query.edit_message_text("⏳ Скачиваю видео...")
-    await run_download_and_send(query.message, url, query.from_user.id)
+    await run_download_and_send(query.message, info, query.from_user.id)
 
 
 def _get_duration_seconds(filepath: Path) -> float | None:
@@ -352,12 +358,12 @@ def compress_to_fit(filepath: Path, target_bytes: int) -> Path:
     return output_path
 
 
-async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> None:
+async def run_download_and_send(status_msg: Message, info: dict, user_id: int) -> None:
     """Скачать видео и отправить его в чат, обновляя статусное сообщение."""
     try:
-        filepath, has_audio = download_video(url, user_id)
+        filepath, has_audio = download_video(info, user_id)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Не удалось скачать %s", url)
+        logger.exception("Не удалось скачать %s", info.get("webpage_url") or info.get("id"))
         await status_msg.edit_text(f"❌ Не удалось скачать это видео.\nПричина: {exc}")
         return
 
@@ -369,9 +375,14 @@ async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> 
             f"🗜 Видео весит {size / 1_048_576:.1f} МБ — это больше лимита "
             "Telegram (50 МБ). Сжимаю..."
         )
-        # небольшой запас под лимит, а не ровно 50 МБ
-        filepath = compress_to_fit(filepath, target_bytes=int(TELEGRAM_SEND_LIMIT_BYTES * 0.95))
-        size = filepath.stat().st_size
+        # Несколько попыток со всё более сильным сжатием (запас растёт
+        # каждый раз), на случай если реальный размер после кодирования
+        # всё равно окажется больше расчётного.
+        for margin in (0.95, 0.80, 0.60):
+            filepath = compress_to_fit(filepath, target_bytes=int(TELEGRAM_SEND_LIMIT_BYTES * margin))
+            size = filepath.stat().st_size
+            if size <= TELEGRAM_SEND_LIMIT_BYTES:
+                break
         was_compressed = size <= TELEGRAM_SEND_LIMIT_BYTES
 
     await status_msg.edit_text(f"✅ Сохранено: {filepath.name} ({size / 1_048_576:.1f} МБ)")
@@ -398,9 +409,9 @@ async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> 
         await status_msg.get_bot().send_message(
             chat_id=status_msg.chat_id,
             text=(
-                "⚠️ Видео больше лимита Telegram на отправку файлов ботом "
-                "(50 МБ), поэтому я сохранил его на сервере, но не могу "
-                "прислать сюда в чат."
+                "⚠️ Даже после сжатия видео больше лимита Telegram на "
+                "отправку файлов ботом (50 МБ) — вероятно, ролик слишком "
+                "длинный. К сожалению, прислать его в чат я не могу."
             ),
         )
 
