@@ -61,14 +61,17 @@ TELEGRAM_SEND_LIMIT_BYTES = 50 * 1024 * 1024  # лимит Bot API на отпр
 
 URL_REGEX = re.compile(r"https?://\S+")
 
-# Формат: сначала явно пытаемся склеить видео с лучшим аудио, отдавая
-# приоритет кодеку H.264 (avc1) — он надёжно проигрывается на iPhone и в
-# Telegram на iOS, в отличие от VP9, который там часто не воспроизводится.
-# VP9 (vp09) остаётся резервным вариантом, если H.264 недоступен.
+# Формат: явно требуем видео H.264 (avc1) + аудио AAC (m4a) — это самая
+# широко совместимая пара кодеков, надёжно проигрывается на iPhone/в
+# Telegram на iOS. Дальше идут более мягкие варианты той же идеи (H.264
+# видео с любым аудио), затем просто лучшее видео+аудио, и только в
+# крайнем случае — единый файл "как есть", каким бы он ни был.
 YDL_FORMAT = (
-    "bestvideo[vcodec^=avc]+bestaudio/"
-    "bestvideo[vcodec^=vp]+bestaudio/"
-    "best[acodec!=none][vcodec!=none]/best"
+    "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+    "bestvideo[vcodec^=avc1]+bestaudio/"
+    "bestvideo+bestaudio/"
+    "best[acodec!=none][vcodec!=none]/"
+    "best"
 )
 
 logging.basicConfig(
