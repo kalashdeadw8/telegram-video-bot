@@ -99,7 +99,7 @@ if _cookies_b64:
 
 # В памяти храним ссылки, ожидающие подтверждения пользователя (когда видео
 # доступно только без звука). Ключ — короткий случайный id для callback_data.
-PENDING_DOWNLOADS: dict[str, dict] = {}
+PENDING_DOWNLOADS: dict[str, str] = {}
 
 
 def build_ydl_opts(outtmpl: str | None = None) -> dict:
@@ -135,13 +135,12 @@ def build_ydl_opts(outtmpl: str | None = None) -> dict:
     return opts
 
 
-def fetch_info(url: str) -> dict:
-    """Один раз запросить у источника информацию о видео (без скачивания
-    самого медиафайла) — эту же info можно потом передать в download_video,
-    чтобы не делать повторный запрос метаданных."""
+def probe_has_audio(url: str) -> bool:
+    """Проверить (без скачивания видео), будет ли у итогового файла звук."""
     ydl_opts = build_ydl_opts()
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=False)
+        info = ydl.extract_info(url, download=False)
+    return _info_has_audio(info)
 
 
 def _info_has_audio(info: dict) -> bool:
@@ -200,14 +199,12 @@ def ensure_iphone_compatible(filepath: Path) -> Path:
     return output_path
 
 
-def download_video(info: dict, user_id: int) -> tuple[Path, bool]:
-    """Скачать медиафайл по уже полученной через fetch_info() информации.
+def download_video(url: str, user_id: int) -> tuple[Path, bool]:
+    """Скачать `url` через yt-dlp.
 
-    Использует process_ie_result вместо повторного extract_info, чтобы не
-    делать второй запрос метаданных к источнику (это и экономит время, и
-    снижает риск получить 403/ограничение от источника за частые запросы).
-
-    Возвращает (путь_к_файлу, has_audio).
+    Возвращает (путь_к_файлу, has_audio). has_audio может оказаться False,
+    даже если предварительная проверка обещала звук, — источник иногда
+    отдаёт разные варианты между запросами.
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     outtmpl = str(DOWNLOAD_DIR / f"{user_id}_{timestamp}_%(title).50s.%(ext)s")
@@ -215,10 +212,10 @@ def download_video(info: dict, user_id: int) -> tuple[Path, bool]:
     ydl_opts = build_ydl_opts(outtmpl)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        result = ydl.process_ie_result(info, download=True)
-        filename = ydl.prepare_filename(result)
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
 
-    has_audio = _info_has_audio(result)
+    has_audio = _info_has_audio(info)
     filepath = ensure_iphone_compatible(Path(filename))
     return filepath, has_audio
 
@@ -247,22 +244,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     status_msg = await update.message.reply_text("🔍 Проверяю видео...")
 
     try:
-        info = fetch_info(url)
+        has_audio = probe_has_audio(url)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Не удалось проверить ссылку %s", url)
         await status_msg.edit_text(f"❌ Не удалось обработать ссылку.\nПричина: {exc}")
         return
 
-    has_audio = _info_has_audio(info)
-
     if has_audio:
         await status_msg.edit_text("⏳ Скачиваю видео...")
-        await run_download_and_send(status_msg, info, update.effective_user.id)
+        await run_download_and_send(status_msg, url, update.effective_user.id)
         return
 
     # Звука нет — спрашиваем подтверждение через кнопки
     callback_id = uuid.uuid4().hex[:12]
-    PENDING_DOWNLOADS[callback_id] = info
+    PENDING_DOWNLOADS[callback_id] = url
 
     keyboard = InlineKeyboardMarkup(
         [
@@ -285,9 +280,9 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
     action, _, callback_id = query.data.partition(":")
-    info = PENDING_DOWNLOADS.pop(callback_id, None)
+    url = PENDING_DOWNLOADS.pop(callback_id, None)
 
-    if info is None:
+    if url is None:
         await query.edit_message_text(
             "⚠️ Это действие уже неактуально. Пришлите ссылку ещё раз."
         )
@@ -298,7 +293,7 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     await query.edit_message_text("⏳ Скачиваю видео...")
-    await run_download_and_send(query.message, info, query.from_user.id)
+    await run_download_and_send(query.message, url, query.from_user.id)
 
 
 def _get_duration_seconds(filepath: Path) -> float | None:
@@ -363,12 +358,12 @@ def compress_to_fit(filepath: Path, target_bytes: int) -> Path:
     return output_path
 
 
-async def run_download_and_send(status_msg: Message, info: dict, user_id: int) -> None:
+async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> None:
     """Скачать видео и отправить его в чат, обновляя статусное сообщение."""
     try:
-        filepath, has_audio = download_video(info, user_id)
+        filepath, has_audio = download_video(url, user_id)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Не удалось скачать %s", info.get("webpage_url") or info.get("id"))
+        logger.exception("Не удалось скачать %s", url)
         await status_msg.edit_text(f"❌ Не удалось скачать это видео.\nПричина: {exc}")
         return
 
