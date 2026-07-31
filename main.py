@@ -103,6 +103,14 @@ def build_ydl_opts(outtmpl: str | None = None) -> dict:
     opts: dict = {
         "format": YDL_FORMAT,
         "merge_output_format": "mp4",
+        # Move MP4 metadata (moov atom) to the start of the file. Without
+        # this, ffmpeg often writes it at the end after merging separate
+        # video+audio streams, which many iOS apps (including Telegram on
+        # iPhone) fail to play even though the codecs themselves are fine.
+        "postprocessor_args": {
+            "merger": ["-movflags", "+faststart"],
+            "videoconvertor": ["-movflags", "+faststart"],
+        },
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
