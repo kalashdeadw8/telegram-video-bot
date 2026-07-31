@@ -295,6 +295,63 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
     await run_download_and_send(query.message, url, query.from_user.id)
 
 
+def _get_duration_seconds(filepath: Path) -> float | None:
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "csv=p=0",
+                str(filepath),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        return float(probe.stdout.strip())
+    except Exception:
+        logger.exception("Не удалось определить длительность видео для %s", filepath)
+        return None
+
+
+def compress_to_fit(filepath: Path, target_bytes: int) -> Path:
+    """Сжать видео так, чтобы оно уместилось в target_bytes.
+
+    Битрейт рассчитывается исходя из длительности ролика с небольшим
+    запасом (5%), чтобы гарантированно попасть под лимит Telegram, а не
+    просто приблизиться к нему.
+    """
+    duration = _get_duration_seconds(filepath)
+    if not duration or duration <= 0:
+        logger.warning("Не удалось получить длительность %s; сжатие пропущено.", filepath)
+        return filepath
+
+    audio_bitrate_kbps = 128
+    # 5% запаса, т.к. реальный размер файла обычно чуть больше расчётного
+    target_total_kbps = (target_bytes * 8 / 1000) / duration * 0.95
+    video_bitrate_kbps = max(int(target_total_kbps - audio_bitrate_kbps), 100)
+
+    output_path = filepath.with_name(filepath.stem + "_compressed.mp4")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(filepath),
+                "-c:v", "libx264", "-preset", "fast",
+                "-b:v", f"{video_bitrate_kbps}k",
+                "-maxrate", f"{video_bitrate_kbps}k",
+                "-bufsize", f"{video_bitrate_kbps * 2}k",
+                "-c:a", "aac", "-b:a", f"{audio_bitrate_kbps}k",
+                "-movflags", "+faststart",
+                str(output_path),
+            ],
+            check=True, capture_output=True, timeout=600,
+        )
+    except Exception:
+        logger.exception("Не удалось сжать %s; отправляю оригинал.", filepath)
+        return filepath
+
+    filepath.unlink(missing_ok=True)
+    return output_path
+
+
 async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> None:
     """Скачать видео и отправить его в чат, обновляя статусное сообщение."""
     try:
@@ -305,13 +362,34 @@ async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> 
         return
 
     size = filepath.stat().st_size
+    was_compressed = False
+
+    if size > TELEGRAM_SEND_LIMIT_BYTES:
+        await status_msg.edit_text(
+            f"🗜 Видео весит {size / 1_048_576:.1f} МБ — это больше лимита "
+            "Telegram (50 МБ). Сжимаю..."
+        )
+        # небольшой запас под лимит, а не ровно 50 МБ
+        filepath = compress_to_fit(filepath, target_bytes=int(TELEGRAM_SEND_LIMIT_BYTES * 0.95))
+        size = filepath.stat().st_size
+        was_compressed = size <= TELEGRAM_SEND_LIMIT_BYTES
+
     await status_msg.edit_text(f"✅ Сохранено: {filepath.name} ({size / 1_048_576:.1f} МБ)")
 
     if size <= TELEGRAM_SEND_LIMIT_BYTES:
-        caption = None if has_audio else (
-            "🔇 Учтите: это видео скачалось без звука — у источника не "
-            "было доступной версии со звуком для этого контента."
-        )
+        notes = []
+        if not has_audio:
+            notes.append(
+                "🔇 Учтите: это видео скачалось без звука — у источника не "
+                "было доступной версии со звуком для этого контента."
+            )
+        if was_compressed:
+            notes.append(
+                "🗜 Видео было сжато, чтобы уместиться в лимит Telegram — "
+                "качество немного ниже оригинала."
+            )
+        caption = "\n\n".join(notes) or None
+
         with filepath.open("rb") as video_file:
             await status_msg.get_bot().send_video(
                 chat_id=status_msg.chat_id, video=video_file, caption=caption
