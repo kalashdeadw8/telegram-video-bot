@@ -32,6 +32,7 @@ import base64
 import logging
 import os
 import re
+import subprocess
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -149,6 +150,55 @@ def _info_has_audio(info: dict) -> bool:
     return True
 
 
+def ensure_iphone_compatible(filepath: Path) -> Path:
+    """Перекодировать видео в H.264/AAC, если оно не в этом кодеке.
+
+    Некоторые источники (например, часть Instagram Reels) отдают видео
+    только в VP9 или другом кодеке, который iPhone/Telegram на iOS не
+    может декодировать: звук играет, но картинка остаётся на первом
+    кадре. Проверяем кодек через ffprobe и, если это не H.264,
+    перекодируем в гарантированно совместимый формат.
+    """
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name",
+                "-of", "csv=p=0",
+                str(filepath),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        codec = probe.stdout.strip().lower()
+    except Exception:
+        logger.exception("Не удалось определить видеокодек через ffprobe для %s", filepath)
+        return filepath
+
+    if codec == "h264":
+        return filepath
+
+    logger.info("Видео в кодеке '%s', перекодирую в H.264 для совместимости с iPhone...", codec)
+    output_path = filepath.with_name(filepath.stem + "_h264.mp4")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(filepath),
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                str(output_path),
+            ],
+            check=True, capture_output=True, timeout=300,
+        )
+    except Exception:
+        logger.exception("Не удалось перекодировать %s; отправляю как есть.", filepath)
+        return filepath
+
+    filepath.unlink(missing_ok=True)
+    return output_path
+
+
 def download_video(url: str, user_id: int) -> tuple[Path, bool]:
     """Скачать `url` через yt-dlp.
 
@@ -165,7 +215,9 @@ def download_video(url: str, user_id: int) -> tuple[Path, bool]:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
 
-    return Path(filename), _info_has_audio(info)
+    has_audio = _info_has_audio(info)
+    filepath = ensure_iphone_compatible(Path(filename))
+    return filepath, has_audio
 
 
 # --------------------------------------------------------------------------- #
