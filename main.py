@@ -340,7 +340,12 @@ def compress_to_fit(filepath: Path, target_bytes: int) -> Path:
         subprocess.run(
             [
                 "ffmpeg", "-y", "-i", str(filepath),
-                "-c:v", "libx264", "-preset", "fast",
+                # Ограничиваем ширину 1280px (720p) — на маленьких серверах
+                # (мало RAM) кодирование полного 1080p+ видео может вызвать
+                # OOM-убийство процесса (SIGKILL). Понижение разрешения
+                # заметно снижает потребление памяти при кодировании.
+                "-vf", "scale='min(1280,iw)':-2",
+                "-c:v", "libx264", "-preset", "veryfast",
                 "-b:v", f"{video_bitrate_kbps}k",
                 "-maxrate", f"{video_bitrate_kbps}k",
                 "-bufsize", f"{video_bitrate_kbps * 2}k",
