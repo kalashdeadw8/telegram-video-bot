@@ -199,12 +199,38 @@ def ensure_iphone_compatible(filepath: Path) -> Path:
     return output_path
 
 
+def file_has_audio_stream(filepath: Path) -> bool:
+    """Проверить сам файл через ffprobe — есть ли в нём аудиодорожка.
+
+    Это надёжнее, чем судить по метаданным yt-dlp (info dict), которые
+    иногда не отражают, что реально оказалось в файле после склейки/
+    перекодирования.
+    """
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a",
+                "-show_entries", "stream=index",
+                "-of", "csv=p=0",
+                str(filepath),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        return bool(probe.stdout.strip())
+    except Exception:
+        logger.exception("Не удалось проверить аудиодорожку через ffprobe для %s", filepath)
+        # Если проверить не удалось — не пугаем пользователя ложным
+        # предупреждением об отсутствии звука.
+        return True
+
+
 def download_video(url: str, user_id: int) -> tuple[Path, bool]:
     """Скачать `url` через yt-dlp.
 
-    Возвращает (путь_к_файлу, has_audio). has_audio может оказаться False,
-    даже если предварительная проверка обещала звук, — источник иногда
-    отдаёт разные варианты между запросами.
+    Возвращает (путь_к_файлу, has_audio). has_audio определяется по
+    реальному итоговому файлу (через ffprobe), а не по метаданным yt-dlp,
+    которые не всегда точно отражают результат.
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     outtmpl = str(DOWNLOAD_DIR / f"{user_id}_{timestamp}_%(title).50s.%(ext)s")
@@ -215,8 +241,8 @@ def download_video(url: str, user_id: int) -> tuple[Path, bool]:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
 
-    has_audio = _info_has_audio(info)
     filepath = ensure_iphone_compatible(Path(filename))
+    has_audio = file_has_audio_stream(filepath)
     return filepath, has_audio
 
 
