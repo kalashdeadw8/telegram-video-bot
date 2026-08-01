@@ -29,6 +29,7 @@ Reddit и сотни других сайтов, поддерживаемых yt-
 """
 
 import base64
+import json
 import logging
 import os
 import re
@@ -197,6 +198,38 @@ def ensure_iphone_compatible(filepath: Path) -> Path:
 
     filepath.unlink(missing_ok=True)
     return output_path
+
+
+def get_video_metadata(filepath: Path) -> dict:
+    """Получить реальные width/height/duration видео через ffprobe.
+
+    Явная передача этих значений в send_video помогает Telegram сразу
+    показать видео с правильными пропорциями (без этого иногда до полной
+    обработки файла превью показывается квадратным, особенно для
+    вертикальных Reels).
+    """
+    result = {"width": None, "height": None, "duration": None}
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height:format=duration",
+                "-of", "json",
+                str(filepath),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        data = json.loads(probe.stdout)
+        stream = (data.get("streams") or [{}])[0]
+        result["width"] = stream.get("width")
+        result["height"] = stream.get("height")
+        duration = (data.get("format") or {}).get("duration")
+        if duration:
+            result["duration"] = int(float(duration))
+    except Exception:
+        logger.exception("Не удалось получить метаданные видео для %s", filepath)
+    return result
 
 
 def file_has_audio_stream(filepath: Path) -> bool:
@@ -426,10 +459,17 @@ async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> 
                 "качество немного ниже оригинала."
             )
         caption = "\n\n".join(notes) or None
+        meta = get_video_metadata(filepath)
 
         with filepath.open("rb") as video_file:
             await status_msg.get_bot().send_video(
-                chat_id=status_msg.chat_id, video=video_file, caption=caption
+                chat_id=status_msg.chat_id,
+                video=video_file,
+                caption=caption,
+                width=meta["width"],
+                height=meta["height"],
+                duration=meta["duration"],
+                supports_streaming=True,
             )
     else:
         await status_msg.get_bot().send_message(
