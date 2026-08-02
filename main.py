@@ -152,42 +152,17 @@ def _info_has_audio(info: dict) -> bool:
 
 
 def ensure_iphone_compatible(filepath: Path) -> Path:
-    """Перекодировать видео в H.264 (8-бит)/AAC, если это не так.
+    """Всегда перекодировать видео в H.264 (8-бит)/AAC с чистыми таймкодами.
 
-    Некоторые источники отдают видео в VP9/AV1, а некоторые — формально
-    в H.264, но в 10-битном цвете (High 10 Profile). В обоих случаях
-    звук на iPhone/Telegram iOS играет нормально, а картинка остаётся на
-    первом кадре, потому что iPhone аппаратно декодирует только обычный
-    8-битный H.264. Проверяем и кодек, и битность через ffprobe.
+    Раньше эта функция пропускала файлы, которые уже выглядели как H.264
+    8-бит — но у части видео (особенно после склейки раздельных DASH-
+    фрагментов видео и аудио) сохраняются неровные тайм-метки кадров.
+    Большинство плееров это прощают, а iOS/AVFoundation — нет: звук
+    играет, но картинка остаётся на первом кадре. Поэтому теперь просто
+    всегда перекодируем — это гарантированно пересобирает файл с нуля,
+    а не просто копирует потоки.
     """
-    try:
-        probe = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=codec_name,pix_fmt",
-                "-of", "csv=p=0",
-                str(filepath),
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        parts = probe.stdout.strip().split(",")
-        codec = parts[0].lower() if len(parts) > 0 else ""
-        pix_fmt = parts[1].lower() if len(parts) > 1 else ""
-    except Exception:
-        logger.exception("Не удалось определить видеокодек через ffprobe для %s", filepath)
-        return filepath
-
-    # yuv420p — обычный 8-битный формат, гарантированно поддерживаемый
-    # iPhone. Любой другой (yuv420p10le, yuvj420p и т.д.) может вызвать
-    # проблемы с воспроизведением на iOS.
-    if codec == "h264" and pix_fmt == "yuv420p":
-        return filepath
-
-    logger.info(
-        "Видео: кодек='%s', pix_fmt='%s' — перекодирую в H.264 8-бит для совместимости с iPhone...",
-        codec, pix_fmt,
-    )
+    logger.info("Перекодирую %s в H.264 8-бит для гарантированной совместимости с iPhone...", filepath)
     output_path = filepath.with_name(filepath.stem + "_h264.mp4")
     try:
         subprocess.run(
@@ -195,6 +170,7 @@ def ensure_iphone_compatible(filepath: Path) -> Path:
                 "ffmpeg", "-y", "-i", str(filepath),
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                 "-pix_fmt", "yuv420p",
+                "-vsync", "cfr", "-r", "30",
                 "-c:a", "aac", "-b:a", "128k",
                 "-movflags", "+faststart",
                 str(output_path),
