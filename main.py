@@ -199,7 +199,7 @@ def _log_stream_diagnostics(filepath: Path) -> None:
         logger.exception("Не удалось получить диагностику потоков для %s", filepath)
 
 
-def ensure_iphone_compatible(filepath: Path) -> Path:
+def ensure_iphone_compatible(filepath: Path) -> tuple[Path, bool]:
     """Гарантированно привести видео к формату, который играет на iPhone.
 
     Раньше здесь стояла эвристика ("перекодировать, только если кодек/
@@ -219,13 +219,13 @@ def ensure_iphone_compatible(filepath: Path) -> Path:
 
     output_path = filepath.with_name(filepath.stem + "_h264.mp4")
     try:
-        subprocess.run(
+        result = subprocess.run(
             [
                 "ffmpeg", "-y", "-i", str(filepath),
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                 "-profile:v", "high", "-level", "4.1",
                 "-pix_fmt", "yuv420p",
-                "-vsync", "cfr", "-r", "30",
+                "-fps_mode", "cfr", "-r", "30",
                 "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
                 "-fflags", "+genpts",
                 "-avoid_negative_ts", "make_zero",
@@ -233,14 +233,42 @@ def ensure_iphone_compatible(filepath: Path) -> Path:
                 "-movflags", "+faststart",
                 str(output_path),
             ],
-            check=True, capture_output=True, timeout=300,
+            capture_output=True, text=True, timeout=300,
         )
-    except Exception:
-        logger.exception("Не удалось перекодировать %s; отправляю как есть.", filepath)
-        return filepath
+    except FileNotFoundError:
+        # Самая коварная причина "перекодировка ничего не изменила":
+        # ffmpeg просто не найден в PATH процесса бота (например, бот
+        # запущен в окружении/контейнере без установленного ffmpeg, или
+        # PATH урезан systemd/supervisor'ом). Тогда КАЖДЫЙ вызов сюда
+        # молча проваливался бы и всегда отправлялся сырой файл.
+        logger.error(
+            "ffmpeg не найден в PATH — перекодировка невозможна ни для одного "
+            "видео. Проверьте, что ffmpeg установлен и доступен процессу бота "
+            "(попробуйте `which ffmpeg` из-под того же пользователя/окружения)."
+        )
+        return filepath, False
+    except subprocess.TimeoutExpired:
+        logger.error("Перекодировка %s превысила таймаут 300с; отправляю как есть.", filepath)
+        return filepath, False
+
+    if result.returncode != 0:
+        logger.error(
+            "ffmpeg вернул код %s при перекодировке %s.\nSTDERR:\n%s",
+            result.returncode, filepath, result.stderr[-4000:],
+        )
+        output_path.unlink(missing_ok=True)
+        return filepath, False
+
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        logger.error(
+            "ffmpeg завершился с кодом 0, но выходной файл %s отсутствует или "
+            "пуст для %s.\nSTDERR:\n%s",
+            output_path, filepath, result.stderr[-4000:],
+        )
+        return filepath, False
 
     filepath.unlink(missing_ok=True)
-    return output_path
+    return output_path, True
 
 
 def get_video_metadata(filepath: Path) -> dict:
@@ -301,12 +329,16 @@ def file_has_audio_stream(filepath: Path) -> bool:
         return True
 
 
-def download_video(url: str, user_id: int) -> tuple[Path, bool]:
+def download_video(url: str, user_id: int) -> tuple[Path, bool, bool]:
     """Скачать `url` через yt-dlp.
 
-    Возвращает (путь_к_файлу, has_audio). has_audio определяется по
-    реальному итоговому файлу (через ffprobe), а не по метаданным yt-dlp,
-    которые не всегда точно отражают результат.
+    Возвращает (путь_к_файлу, has_audio, transcode_ok). has_audio
+    определяется по реальному итоговому файлу (через ffprobe), а не по
+    метаданным yt-dlp, которые не всегда точно отражают результат.
+    transcode_ok == False означает, что перекодировка в совместимый с
+    iPhone формат не удалась и пользователю уйдёт исходный файл как есть
+    — в таком случае проблемы с воспроизведением на iPhone ожидаемы, и
+    подробности будут в логах (см. ensure_iphone_compatible).
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     outtmpl = str(DOWNLOAD_DIR / f"{user_id}_{timestamp}_%(title).50s.%(ext)s")
@@ -317,9 +349,9 @@ def download_video(url: str, user_id: int) -> tuple[Path, bool]:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
 
-    filepath = ensure_iphone_compatible(Path(filename))
+    filepath, transcode_ok = ensure_iphone_compatible(Path(filename))
     has_audio = file_has_audio_stream(filepath)
-    return filepath, has_audio
+    return filepath, has_audio, transcode_ok
 
 
 
@@ -472,7 +504,7 @@ async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> 
 
     async with DOWNLOAD_SEMAPHORE:
         try:
-            filepath, has_audio = await asyncio.to_thread(download_video, url, user_id)
+            filepath, has_audio, transcode_ok = await asyncio.to_thread(download_video, url, user_id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Не удалось скачать %s", url)
             await status_msg.edit_text(f"❌ Не удалось скачать это видео.\nПричина: {exc}")
@@ -502,6 +534,13 @@ async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> 
 
     if size <= TELEGRAM_SEND_LIMIT_BYTES:
         notes = []
+        if not transcode_ok:
+            notes.append(
+                "⚠️ Не удалось привести видео к формату, совместимому с "
+                "iPhone (подробности в логах бота) — на iPhone это видео "
+                "может не воспроизводиться или зависать на первом кадре. "
+                "На Android/десктопе должно быть без проблем."
+            )
         if not has_audio:
             notes.append(
                 "🔇 Учтите: это видео скачалось без звука — у источника не "
