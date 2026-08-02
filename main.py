@@ -173,83 +173,50 @@ def _info_has_audio(info: dict) -> bool:
     return True
 
 
-def ensure_iphone_compatible(filepath: Path) -> Path:
-    """Перекодировать видео в H.264/AAC, если оно не в этом кодеке.
+def _log_stream_diagnostics(filepath: Path) -> None:
+    """Записать в лог полные параметры видео/аудио потоков файла.
 
-    Некоторые источники (например, часть Instagram Reels) отдают видео
-    только в VP9 или другом кодеке, который iPhone/Telegram на iOS не
-    может декодировать: звук играет, но картинка остаётся на первом
-    кадре. Проверяем кодек через ffprobe и, если это не H.264,
-    перекодируем в гарантированно совместимый формат.
+    Это не влияет на работу бота, а нужно только для диагностики: если
+    какое-то видео всё же не заиграет на iPhone, в логах будет видно
+    codec/profile/pix_fmt/framerate и т.д. этого конкретного файла, и
+    можно будет прицельно расширить логику перекодирования вместо
+    гадания вслепую.
     """
     try:
         probe = subprocess.run(
             [
                 "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=codec_name,profile,pix_fmt,level",
+                "-show_entries",
+                "stream=index,codec_type,codec_name,profile,pix_fmt,level,"
+                "r_frame_rate,avg_frame_rate,start_time:format=duration,format_name",
                 "-of", "json",
                 str(filepath),
             ],
             capture_output=True, text=True, timeout=30,
         )
-        stream = (json.loads(probe.stdout).get("streams") or [{}])[0]
-        codec = (stream.get("codec_name") or "").lower()
-        profile = (stream.get("profile") or "").lower()
-        pix_fmt = (stream.get("pix_fmt") or "").lower()
-        level = stream.get("level")
+        logger.info("Диагностика потоков %s: %s", filepath.name, probe.stdout.strip())
     except Exception:
-        logger.exception("Не удалось определить параметры видео через ffprobe для %s", filepath)
-        return filepath
+        logger.exception("Не удалось получить диагностику потоков для %s", filepath)
 
-    # iPhone/Telegram iOS декодируют H.264 аппаратно только при довольно
-    # узком наборе параметров: 8-бит, цветовая субдискретизация 4:2:0,
-    # профиль не выше High, level в разумных пределах. Видео с тем же
-    # codec_name='h264', но, например, 10-битное или в 4:4:4/4:2:2 (иногда
-    # отдают Instagram/скринкасты) аппаратный декодер молча не тянет:
-    # звук идёт, а картинка замирает на первом кадре. Поэтому одного
-    # сравнения codec_name недостаточно — нужно смотреть профиль и pix_fmt.
-    is_compatible = (
-        codec == "h264"
-        and "4:4:4" not in profile
-        and "4:2:2" not in profile
-        and pix_fmt in ("yuv420p", "yuvj420p")
-        and (level is None or level <= 42)
-    )
 
-    # Даже когда кодек полностью совместим, файл мог быть смёржен yt-dlp
-    # через `ffmpeg -c copy` (это дефолт для видео+аудио, скачанных
-    # раздельно). При копировании стримов сохраняются исходные PTS/DTS,
-    # которые могут быть не выровнены по нулю — строгий iOS-декодер на
-    # такое тоже иногда реагирует "застыванием" на первом кадре, хотя
-    # десктопные плееры это прощают. Поэтому дополнительно проверяем,
-    # не начинается ли видеопоток с ненулевого/отрицательного времени.
-    if is_compatible:
-        try:
-            ts_probe = subprocess.run(
-                [
-                    "ffprobe", "-v", "error",
-                    "-select_streams", "v:0",
-                    "-show_entries", "stream=start_time",
-                    "-of", "csv=p=0",
-                    str(filepath),
-                ],
-                capture_output=True, text=True, timeout=30,
-            )
-            start_time = float(ts_probe.stdout.strip() or 0)
-            if abs(start_time) > 0.05:
-                is_compatible = False
-        except Exception:
-            pass  # не критично, не блокируем из-за этого
+def ensure_iphone_compatible(filepath: Path) -> Path:
+    """Гарантированно привести видео к формату, который играет на iPhone.
 
-    if is_compatible:
-        return filepath
+    Раньше здесь стояла эвристика ("перекодировать, только если кодек/
+    профиль/pix_fmt выглядят подозрительно"), но практика показала, что
+    список причин, из-за которых iOS-декодер Telegram отказывается
+    декодировать видео (застревает на первом кадре при играющем звуке),
+    шире, чем можно надёжно перечислить: сюда попадают не только 10-bit/
+    4:4:4/4:2:2, но и fragmented mp4 без полноценного moov, переменный
+    frame rate (VFR), нестандартный порядок B-кадров после `-c copy`
+    мёржа видео+аудио и т.п. Пытаться детектировать каждый случай
+    отдельно — гонка с новыми источниками. Поэтому теперь ролик всегда
+    безусловно перекодируется в заведомо совместимый профиль: H.264
+    High@4.1, 8-bit, 4:2:0, постоянный frame rate, AAC, moov в начале
+    файла. Это чуть дороже по CPU, зато исключает целый класс багов.
+    """
+    _log_stream_diagnostics(filepath)
 
-    logger.info(
-        "Видео несовместимо с iPhone (codec=%s, profile=%s, pix_fmt=%s, level=%s), "
-        "перекодирую в H.264 8-bit 4:2:0...",
-        codec, profile, pix_fmt, level,
-    )
     output_path = filepath.with_name(filepath.stem + "_h264.mp4")
     try:
         subprocess.run(
@@ -258,9 +225,11 @@ def ensure_iphone_compatible(filepath: Path) -> Path:
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                 "-profile:v", "high", "-level", "4.1",
                 "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "128k",
+                "-vsync", "cfr", "-r", "30",
+                "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
                 "-fflags", "+genpts",
                 "-avoid_negative_ts", "make_zero",
+                "-max_muxing_queue_size", "1024",
                 "-movflags", "+faststart",
                 str(output_path),
             ],
