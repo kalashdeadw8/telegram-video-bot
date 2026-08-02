@@ -63,6 +63,15 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 TELEGRAM_SEND_LIMIT_BYTES = 50 * 1024 * 1024  # лимит Bot API на отправку файла
 
+# Без явного лимита ffmpeg сам определяет число потоков кодирования по
+# количеству ядер, которое видит в системе. На многих PaaS-хостингах
+# (Railway/Render/Fly и т.п.) контейнеру видно host-овское количество ядер
+# (может быть и 32, и 60), но НЕ host-овский лимит памяти — в результате
+# ffmpeg запускает кодирование в десятки потоков, буферы кадров разрастаются
+# кратно, и процесс убивает OOM killer контейнера (subprocess получает
+# SIGKILL, код возврата -9). Поэтому жёстко ограничиваем число потоков.
+FFMPEG_THREADS = os.environ.get("FFMPEG_THREADS", "2")
+
 URL_REGEX = re.compile(r"https?://\S+")
 
 # Формат: явно требуем видео H.264 (avc1) + аудио AAC (m4a) — это самая
@@ -223,9 +232,10 @@ def ensure_iphone_compatible(filepath: Path) -> tuple[Path, bool]:
             [
                 "ffmpeg", "-y", "-i", str(filepath),
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-profile:v", "high", "-level", "4.1",
+                "-profile:v", "high", "-level", "5.1",
                 "-pix_fmt", "yuv420p",
-                "-fps_mode", "cfr", "-r", "30",
+                "-fps_mode", "cfr",
+                "-threads", FFMPEG_THREADS,
                 "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
                 "-fflags", "+genpts",
                 "-avoid_negative_ts", "make_zero",
