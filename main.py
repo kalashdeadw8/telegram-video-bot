@@ -28,12 +28,14 @@ Reddit и сотни других сайтов, поддерживаемых yt-
       друг друга.
 """
 
+import asyncio
 import base64
 import json
 import logging
 import os
 import re
 import subprocess
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -99,8 +101,28 @@ if _cookies_b64:
         logger.exception("Не удалось декодировать COOKIES_B64; продолжаю без cookies.")
 
 # В памяти храним ссылки, ожидающие подтверждения пользователя (когда видео
-# доступно только без звука). Ключ — короткий случайный id для callback_data.
-PENDING_DOWNLOADS: dict[str, str] = {}
+# доступно только без звука). Ключ — короткий случайный id для callback_data,
+# значение — (url, время_создания), чтобы можно было чистить протухшие записи.
+PENDING_DOWNLOADS: dict[str, tuple[str, float]] = {}
+PENDING_DOWNLOAD_TTL_SECONDS = 15 * 60  # неподтверждённые ссылки живут 15 минут
+
+# Ограничение на число одновременных скачиваний/перекодирований. Каждое из
+# них может создавать тяжёлую нагрузку на CPU (ffmpeg) и диск, поэтому без
+# лимита несколько параллельных запросов от разных пользователей способны
+# положить сервер. Значение настраивается через переменную окружения.
+MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "2"))
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+
+
+def _cleanup_pending_downloads() -> None:
+    """Удалить протухшие неподтверждённые ссылки, чтобы словарь не рос бесконечно."""
+    now = time.monotonic()
+    expired = [
+        cid for cid, (_, created_at) in PENDING_DOWNLOADS.items()
+        if now - created_at > PENDING_DOWNLOAD_TTL_SECONDS
+    ]
+    for cid in expired:
+        PENDING_DOWNLOADS.pop(cid, None)
 
 
 def build_ydl_opts(outtmpl: str | None = None) -> dict:
@@ -152,26 +174,93 @@ def _info_has_audio(info: dict) -> bool:
 
 
 def ensure_iphone_compatible(filepath: Path) -> Path:
-    """Всегда перекодировать видео в H.264 (8-бит)/AAC с чистыми таймкодами.
+    """Перекодировать видео в H.264/AAC, если оно не в этом кодеке.
 
-    Раньше эта функция пропускала файлы, которые уже выглядели как H.264
-    8-бит — но у части видео (особенно после склейки раздельных DASH-
-    фрагментов видео и аудио) сохраняются неровные тайм-метки кадров.
-    Большинство плееров это прощают, а iOS/AVFoundation — нет: звук
-    играет, но картинка остаётся на первом кадре. Поэтому теперь просто
-    всегда перекодируем — это гарантированно пересобирает файл с нуля,
-    а не просто копирует потоки.
+    Некоторые источники (например, часть Instagram Reels) отдают видео
+    только в VP9 или другом кодеке, который iPhone/Telegram на iOS не
+    может декодировать: звук играет, но картинка остаётся на первом
+    кадре. Проверяем кодек через ffprobe и, если это не H.264,
+    перекодируем в гарантированно совместимый формат.
     """
-    logger.info("Перекодирую %s в H.264 8-бит для гарантированной совместимости с iPhone...", filepath)
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name,profile,pix_fmt,level",
+                "-of", "json",
+                str(filepath),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        stream = (json.loads(probe.stdout).get("streams") or [{}])[0]
+        codec = (stream.get("codec_name") or "").lower()
+        profile = (stream.get("profile") or "").lower()
+        pix_fmt = (stream.get("pix_fmt") or "").lower()
+        level = stream.get("level")
+    except Exception:
+        logger.exception("Не удалось определить параметры видео через ffprobe для %s", filepath)
+        return filepath
+
+    # iPhone/Telegram iOS декодируют H.264 аппаратно только при довольно
+    # узком наборе параметров: 8-бит, цветовая субдискретизация 4:2:0,
+    # профиль не выше High, level в разумных пределах. Видео с тем же
+    # codec_name='h264', но, например, 10-битное или в 4:4:4/4:2:2 (иногда
+    # отдают Instagram/скринкасты) аппаратный декодер молча не тянет:
+    # звук идёт, а картинка замирает на первом кадре. Поэтому одного
+    # сравнения codec_name недостаточно — нужно смотреть профиль и pix_fmt.
+    is_compatible = (
+        codec == "h264"
+        and "4:4:4" not in profile
+        and "4:2:2" not in profile
+        and pix_fmt in ("yuv420p", "yuvj420p")
+        and (level is None or level <= 42)
+    )
+
+    # Даже когда кодек полностью совместим, файл мог быть смёржен yt-dlp
+    # через `ffmpeg -c copy` (это дефолт для видео+аудио, скачанных
+    # раздельно). При копировании стримов сохраняются исходные PTS/DTS,
+    # которые могут быть не выровнены по нулю — строгий iOS-декодер на
+    # такое тоже иногда реагирует "застыванием" на первом кадре, хотя
+    # десктопные плееры это прощают. Поэтому дополнительно проверяем,
+    # не начинается ли видеопоток с ненулевого/отрицательного времени.
+    if is_compatible:
+        try:
+            ts_probe = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=start_time",
+                    "-of", "csv=p=0",
+                    str(filepath),
+                ],
+                capture_output=True, text=True, timeout=30,
+            )
+            start_time = float(ts_probe.stdout.strip() or 0)
+            if abs(start_time) > 0.05:
+                is_compatible = False
+        except Exception:
+            pass  # не критично, не блокируем из-за этого
+
+    if is_compatible:
+        return filepath
+
+    logger.info(
+        "Видео несовместимо с iPhone (codec=%s, profile=%s, pix_fmt=%s, level=%s), "
+        "перекодирую в H.264 8-bit 4:2:0...",
+        codec, profile, pix_fmt, level,
+    )
     output_path = filepath.with_name(filepath.stem + "_h264.mp4")
     try:
         subprocess.run(
             [
                 "ffmpeg", "-y", "-i", str(filepath),
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-profile:v", "high", "-level", "4.1",
                 "-pix_fmt", "yuv420p",
-                "-vsync", "cfr", "-r", "30",
                 "-c:a", "aac", "-b:a", "128k",
+                "-fflags", "+genpts",
+                "-avoid_negative_ts", "make_zero",
                 "-movflags", "+faststart",
                 str(output_path),
             ],
@@ -288,7 +377,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     status_msg = await update.message.reply_text("🔍 Проверяю видео...")
 
     try:
-        has_audio = probe_has_audio(url)
+        has_audio = await asyncio.to_thread(probe_has_audio, url)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Не удалось проверить ссылку %s", url)
         await status_msg.edit_text(f"❌ Не удалось обработать ссылку.\nПричина: {exc}")
@@ -300,8 +389,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     # Звука нет — спрашиваем подтверждение через кнопки
+    _cleanup_pending_downloads()
     callback_id = uuid.uuid4().hex[:12]
-    PENDING_DOWNLOADS[callback_id] = url
+    PENDING_DOWNLOADS[callback_id] = (url, time.monotonic())
 
     keyboard = InlineKeyboardMarkup(
         [
@@ -324,13 +414,15 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
     action, _, callback_id = query.data.partition(":")
-    url = PENDING_DOWNLOADS.pop(callback_id, None)
+    pending = PENDING_DOWNLOADS.pop(callback_id, None)
 
-    if url is None:
+    if pending is None:
         await query.edit_message_text(
             "⚠️ Это действие уже неактуально. Пришлите ссылку ещё раз."
         )
         return
+
+    url, _created_at = pending
 
     if action == "dl_no":
         await query.edit_message_text("Отменено. Можете прислать другую ссылку.")
@@ -385,7 +477,6 @@ def compress_to_fit(filepath: Path, target_bytes: int) -> Path:
                 # заметно снижает потребление памяти при кодировании.
                 "-vf", "scale='min(1280,iw)':-2",
                 "-c:v", "libx264", "-preset", "veryfast",
-                "-pix_fmt", "yuv420p",
                 "-b:v", f"{video_bitrate_kbps}k",
                 "-maxrate", f"{video_bitrate_kbps}k",
                 "-bufsize", f"{video_bitrate_kbps * 2}k",
@@ -405,30 +496,38 @@ def compress_to_fit(filepath: Path, target_bytes: int) -> Path:
 
 async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> None:
     """Скачать видео и отправить его в чат, обновляя статусное сообщение."""
-    try:
-        filepath, has_audio = download_video(url, user_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Не удалось скачать %s", url)
-        await status_msg.edit_text(f"❌ Не удалось скачать это видео.\nПричина: {exc}")
-        return
-
-    size = filepath.stat().st_size
-    was_compressed = False
-
-    if size > TELEGRAM_SEND_LIMIT_BYTES:
+    if DOWNLOAD_SEMAPHORE.locked():
         await status_msg.edit_text(
-            f"🗜 Видео весит {size / 1_048_576:.1f} МБ — это больше лимита "
-            "Telegram (50 МБ). Сжимаю..."
+            "⏳ Сервер уже занят другой загрузкой, ваш запрос встал в очередь..."
         )
-        # Несколько попыток со всё более сильным сжатием (запас растёт
-        # каждый раз), на случай если реальный размер после кодирования
-        # всё равно окажется больше расчётного.
-        for margin in (0.95, 0.80, 0.60):
-            filepath = compress_to_fit(filepath, target_bytes=int(TELEGRAM_SEND_LIMIT_BYTES * margin))
-            size = filepath.stat().st_size
-            if size <= TELEGRAM_SEND_LIMIT_BYTES:
-                break
-        was_compressed = size <= TELEGRAM_SEND_LIMIT_BYTES
+
+    async with DOWNLOAD_SEMAPHORE:
+        try:
+            filepath, has_audio = await asyncio.to_thread(download_video, url, user_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Не удалось скачать %s", url)
+            await status_msg.edit_text(f"❌ Не удалось скачать это видео.\nПричина: {exc}")
+            return
+
+        size = filepath.stat().st_size
+        was_compressed = False
+
+        if size > TELEGRAM_SEND_LIMIT_BYTES:
+            await status_msg.edit_text(
+                f"🗜 Видео весит {size / 1_048_576:.1f} МБ — это больше лимита "
+                "Telegram (50 МБ). Сжимаю..."
+            )
+            # Несколько попыток со всё более сильным сжатием (запас растёт
+            # каждый раз), на случай если реальный размер после кодирования
+            # всё равно окажется больше расчётного.
+            for margin in (0.95, 0.80, 0.60):
+                filepath = await asyncio.to_thread(
+                    compress_to_fit, filepath, target_bytes=int(TELEGRAM_SEND_LIMIT_BYTES * margin)
+                )
+                size = filepath.stat().st_size
+                if size <= TELEGRAM_SEND_LIMIT_BYTES:
+                    break
+            was_compressed = size <= TELEGRAM_SEND_LIMIT_BYTES
 
     await status_msg.edit_text(f"✅ Сохранено: {filepath.name} ({size / 1_048_576:.1f} МБ)")
 
@@ -445,7 +544,7 @@ async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> 
                 "качество немного ниже оригинала."
             )
         caption = "\n\n".join(notes) or None
-        meta = get_video_metadata(filepath)
+        meta = await asyncio.to_thread(get_video_metadata, filepath)
 
         with filepath.open("rb") as video_file:
             await status_msg.get_bot().send_video(
