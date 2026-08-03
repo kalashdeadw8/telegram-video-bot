@@ -30,11 +30,13 @@ Reddit и сотни других сайтов, поддерживаемых yt-
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import os
 import re
 import subprocess
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -130,6 +132,30 @@ DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 DOWNLOAD_FILE_TTL_SECONDS = int(os.environ.get("DOWNLOAD_FILE_TTL_SECONDS", str(24 * 3600)))
 
 
+class ProgressTracker:
+    """Потокобезопасный "почтовый ящик" для текста прогресса.
+
+    download_video выполняется в отдельном потоке (через asyncio.to_thread),
+    а yt-dlp и ffmpeg сообщают о прогрессе синхронно, из этого же потока.
+    Чтобы не дёргать Telegram API на каждый чих (и не блокировать worker-поток
+    сетевыми вызовами), поток просто кладёт сюда последний текст статуса,
+    а отдельная async-задача в event loop периодически его вычитывает и
+    обновляет сообщение в чате.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._text: str | None = None
+
+    def set(self, text: str) -> None:
+        with self._lock:
+            self._text = text
+
+    def get(self) -> str | None:
+        with self._lock:
+            return self._text
+
+
 def _cleanup_pending_downloads() -> None:
     """Удалить протухшие неподтверждённые ссылки, чтобы словарь не рос бесконечно."""
     now = time.monotonic()
@@ -157,8 +183,28 @@ def _cleanup_old_downloads(max_age_seconds: int = DOWNLOAD_FILE_TTL_SECONDS) -> 
             logger.exception("Не удалось удалить старый файл %s", f)
 
 
-def build_ydl_opts(outtmpl: str | None = None) -> dict:
-    """Собрать общие опции yt-dlp (формат, cookies, прокси)."""
+def _make_ytdlp_progress_hook(tracker: "ProgressTracker"):
+    """Хук для yt-dlp: пишет процент и скорость скачивания в tracker."""
+
+    def hook(d: dict) -> None:
+        status = d.get("status")
+        if status == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            downloaded = d.get("downloaded_bytes") or 0
+            speed = d.get("speed") or 0
+            if total:
+                percent = downloaded / total * 100
+                tracker.set(f"⏳ Скачиваю видео... {percent:.0f}% ({speed / 1_048_576:.1f} МБ/с)")
+            else:
+                tracker.set(f"⏳ Скачиваю видео... {downloaded / 1_048_576:.1f} МБ")
+        elif status == "finished":
+            tracker.set("📦 Видео скачано, обрабатываю...")
+
+    return hook
+
+
+def build_ydl_opts(outtmpl: str | None = None, tracker: "ProgressTracker | None" = None) -> dict:
+    """Собрать общие опции yt-dlp (формат, cookies, прокси, прогресс)."""
     opts: dict = {
         "format": YDL_FORMAT,
         "merge_output_format": "mp4",
@@ -176,6 +222,9 @@ def build_ydl_opts(outtmpl: str | None = None) -> dict:
     }
     if outtmpl:
         opts["outtmpl"] = outtmpl
+
+    if tracker is not None:
+        opts["progress_hooks"] = [_make_ytdlp_progress_hook(tracker)]
 
     if COOKIES_FILE.exists():
         opts["cookiefile"] = str(COOKIES_FILE)
@@ -245,10 +294,66 @@ def probe_media_file(filepath: Path) -> dict:
     return result
 
 
-def _run_ffmpeg(cmd: list[str], filepath: Path, output_path: Path, timeout: int) -> tuple[Path, bool]:
-    """Запустить ffmpeg и вернуть (путь_к_файлу, успех)."""
+def _run_ffmpeg(
+    cmd: list[str],
+    filepath: Path,
+    output_path: Path,
+    timeout: int,
+    tracker: "ProgressTracker | None" = None,
+    duration: float | None = None,
+    phase_label: str = "Обрабатываю видео",
+) -> tuple[Path, bool]:
+    """Запустить ffmpeg и вернуть (путь_к_файлу, успех).
+
+    Если переданы tracker и duration, дополнительно стримит процент
+    выполнения в tracker: добавляем к команде `-progress pipe:1` (машиночитаемый
+    прогресс ffmpeg вида `out_time_ms=...`) и читаем его построчно из stdout,
+    параллельно собирая обычный лог (stderr смешан в тот же поток) на случай
+    ошибки — без этого пришлось бы читать stdout и stderr отдельными потоками
+    и рисковать дедлоком на переполненном буфере.
+    """
+    if tracker is not None and duration:
+        # -progress должен идти после входа/фильтров, но до выходного файла —
+        # он последний элемент cmd, поэтому просто вставляем перед ним.
+        cmd = cmd[:-1] + ["-progress", "pipe:1", "-nostats"] + cmd[-1:]
+
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if tracker is not None and duration:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+            log_tail: list[str] = []
+            start = time.monotonic()
+            timed_out = False
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                if line.startswith("out_time_ms="):
+                    try:
+                        out_time_s = int(line.split("=", 1)[1]) / 1_000_000
+                        percent = min(out_time_s / duration * 100, 99)
+                        tracker.set(f"🎬 {phase_label}... {percent:.0f}%")
+                    except (ValueError, ZeroDivisionError):
+                        pass
+                else:
+                    log_tail.append(line)
+                    log_tail = log_tail[-200:]
+                if time.monotonic() - start > timeout:
+                    proc.kill()
+                    timed_out = True
+                    break
+            returncode = proc.wait(timeout=30)
+            stderr_text = "\n".join(log_tail)
+            if timed_out:
+                logger.error(
+                    "Перекодировка %s превысила таймаут %ss; отправляю как есть.",
+                    filepath, timeout,
+                )
+                return filepath, False
+        else:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            returncode = result.returncode
+            stderr_text = result.stderr
     except FileNotFoundError:
         logger.error(
             "ffmpeg не найден в PATH — перекодировка невозможна ни для одного "
@@ -260,10 +365,10 @@ def _run_ffmpeg(cmd: list[str], filepath: Path, output_path: Path, timeout: int)
         logger.error("Перекодировка %s превысила таймаут %ss; отправляю как есть.", filepath, timeout)
         return filepath, False
 
-    if result.returncode != 0:
+    if returncode != 0:
         logger.error(
             "ffmpeg вернул код %s при перекодировке %s.\nSTDERR:\n%s",
-            result.returncode, filepath, result.stderr[-4000:],
+            returncode, filepath, stderr_text[-4000:],
         )
         output_path.unlink(missing_ok=True)
         return filepath, False
@@ -272,11 +377,13 @@ def _run_ffmpeg(cmd: list[str], filepath: Path, output_path: Path, timeout: int)
         logger.error(
             "ffmpeg завершился с кодом 0, но выходной файл %s отсутствует или "
             "пуст для %s.\nSTDERR:\n%s",
-            output_path, filepath, result.stderr[-4000:],
+            output_path, filepath, stderr_text[-4000:],
         )
         return filepath, False
 
     filepath.unlink(missing_ok=True)
+    if tracker is not None:
+        tracker.set(f"🎬 {phase_label}... 100%")
     return output_path, True
 
 
@@ -298,7 +405,11 @@ def _iphone_video_base_args() -> list[str]:
     ]
 
 
-def ensure_iphone_compatible(filepath: Path) -> tuple[Path, bool]:
+def ensure_iphone_compatible(
+    filepath: Path,
+    tracker: "ProgressTracker | None" = None,
+    duration: float | None = None,
+) -> tuple[Path, bool]:
     """Гарантированно привести видео к формату, который играет на iPhone.
 
     Раньше здесь стояла эвристика ("перекодировать, только если кодек/
@@ -322,13 +433,17 @@ def ensure_iphone_compatible(filepath: Path) -> tuple[Path, bool]:
         *_iphone_audio_args(),
         str(output_path),
     ]
-    return _run_ffmpeg(cmd, filepath, output_path, timeout=300)
+    return _run_ffmpeg(
+        cmd, filepath, output_path, timeout=300,
+        tracker=tracker, duration=duration, phase_label="Привожу к формату для iPhone",
+    )
 
 
 def transcode_iphone_compressed(
     filepath: Path,
     target_bytes: int,
     duration: float | None = None,
+    tracker: "ProgressTracker | None" = None,
 ) -> tuple[Path, bool]:
     """Перекодировать в iPhone-совместимый формат и уложиться в target_bytes.
 
@@ -357,10 +472,16 @@ def transcode_iphone_compressed(
         *_iphone_audio_args(),
         str(output_path),
     ]
-    return _run_ffmpeg(cmd, filepath, output_path, timeout=600)
+    return _run_ffmpeg(
+        cmd, filepath, output_path, timeout=600,
+        tracker=tracker, duration=duration, phase_label="Сжимаю видео под лимит Telegram",
+    )
 
 
-def _compress_with_margins(filepath: Path) -> tuple[Path, bool]:
+def _compress_with_margins(
+    filepath: Path,
+    tracker: "ProgressTracker | None" = None,
+) -> tuple[Path, bool]:
     """Сжать видео под лимит Telegram, подобрав запас по фактическому превышению.
 
     Раньше здесь была "лесенка" из трёх фиксированных margin'ов (0.95, 0.80,
@@ -385,11 +506,13 @@ def _compress_with_margins(filepath: Path) -> tuple[Path, bool]:
         margin = 0.65
 
     target = int(TELEGRAM_SEND_LIMIT_BYTES * margin)
-    filepath, transcode_ok = transcode_iphone_compressed(filepath, target, duration=duration)
+    filepath, transcode_ok = transcode_iphone_compressed(filepath, target, duration=duration, tracker=tracker)
 
     if filepath.stat().st_size > TELEGRAM_SEND_LIMIT_BYTES:
         fallback_target = int(TELEGRAM_SEND_LIMIT_BYTES * 0.6)
-        filepath, ok2 = transcode_iphone_compressed(filepath, fallback_target, duration=duration)
+        filepath, ok2 = transcode_iphone_compressed(
+            filepath, fallback_target, duration=duration, tracker=tracker
+        )
         transcode_ok = transcode_ok and ok2
 
     return filepath, transcode_ok
@@ -399,6 +522,7 @@ def download_video(
     url: str,
     user_id: int,
     prefetched_info: dict | None = None,
+    tracker: "ProgressTracker | None" = None,
 ) -> tuple[Path, bool, bool, dict, bool]:
     """Скачать `url` через yt-dlp.
 
@@ -406,11 +530,13 @@ def download_video(
     has_audio определяется по реальному итоговому файлу (через ffprobe).
     prefetched_info — метаданные из fetch_video_info, чтобы не вызывать
     extract_info повторно при скачивании.
+    tracker (опционально) получает текстовые обновления прогресса скачивания
+    и перекодирования, которые затем показываются пользователю в чате.
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     outtmpl = str(DOWNLOAD_DIR / f"{user_id}_{timestamp}_%(title).50s.%(ext)s")
 
-    ydl_opts = build_ydl_opts(outtmpl)
+    ydl_opts = build_ydl_opts(outtmpl, tracker=tracker)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         if prefetched_info is not None:
@@ -424,12 +550,13 @@ def download_video(
     was_compressed = False
 
     if filepath.stat().st_size > TELEGRAM_SEND_LIMIT_BYTES:
-        filepath, transcode_ok = _compress_with_margins(filepath)
+        filepath, transcode_ok = _compress_with_margins(filepath, tracker=tracker)
         was_compressed = True
     else:
-        filepath, transcode_ok = ensure_iphone_compatible(filepath)
+        duration = probe_media_file(filepath).get("duration_seconds")
+        filepath, transcode_ok = ensure_iphone_compatible(filepath, tracker=tracker, duration=duration)
         if filepath.stat().st_size > TELEGRAM_SEND_LIMIT_BYTES:
-            filepath, compress_ok = _compress_with_margins(filepath)
+            filepath, compress_ok = _compress_with_margins(filepath, tracker=tracker)
             transcode_ok = transcode_ok and compress_ok
             was_compressed = True
 
@@ -517,6 +644,32 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
     await run_download_and_send(query.message, url, query.from_user.id, prefetched_info=info)
 
 
+async def _report_progress(status_msg: Message, tracker: ProgressTracker, interval: float = 2.5) -> None:
+    """Пока идёт скачивание/перекодирование, периодически обновлять статусное
+    сообщение текстом из tracker.
+
+    Опрос вместо мгновенной реакции на каждое обновление — намеренно: тракер
+    может обновляться из worker-потока десятки раз в секунду (yt-dlp,
+    ffmpeg), а Telegram банит частые edit_message_text. Редактируем не чаще
+    interval и только если текст реально изменился.
+    """
+    last_text: str | None = None
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            text = tracker.get()
+            if text and text != last_text:
+                last_text = text
+                try:
+                    await status_msg.edit_text(text)
+                except Exception:  # noqa: BLE001
+                    # "Message is not modified", флуд-лимиты и т.п. — не критично,
+                    # следующее обновление подхватит актуальный текст.
+                    pass
+    except asyncio.CancelledError:
+        pass
+
+
 async def run_download_and_send(
     status_msg: Message,
     url: str,
@@ -532,14 +685,20 @@ async def run_download_and_send(
         )
 
     async with DOWNLOAD_SEMAPHORE:
+        tracker = ProgressTracker()
+        progress_task = asyncio.create_task(_report_progress(status_msg, tracker))
         try:
             filepath, has_audio, transcode_ok, media, was_compressed = await asyncio.to_thread(
-                download_video, url, user_id, prefetched_info
+                download_video, url, user_id, prefetched_info, tracker
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Не удалось скачать %s", url)
             await status_msg.edit_text(f"❌ Не удалось скачать это видео.\nПричина: {exc}")
             return
+        finally:
+            progress_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await progress_task
 
         size = filepath.stat().st_size
 
