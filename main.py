@@ -123,6 +123,12 @@ PENDING_DOWNLOAD_TTL_SECONDS = 15 * 60  # неподтверждённые сс�
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "2"))
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
+# Скачанные и перекодированные файлы копятся в DOWNLOAD_DIR и никогда не
+# удаляются сами по себе, хотя пользователю уже отправлена копия в чат —
+# без очистки диск сервера рано или поздно закончится. Файлы старше этого
+# возраста удаляются в начале каждой новой закачки.
+DOWNLOAD_FILE_TTL_SECONDS = int(os.environ.get("DOWNLOAD_FILE_TTL_SECONDS", str(24 * 3600)))
+
 
 def _cleanup_pending_downloads() -> None:
     """Удалить протухшие неподтверждённые ссылки, чтобы словарь не рос бесконечно."""
@@ -133,6 +139,22 @@ def _cleanup_pending_downloads() -> None:
     ]
     for cid in expired:
         PENDING_DOWNLOADS.pop(cid, None)
+
+
+def _cleanup_old_downloads(max_age_seconds: int = DOWNLOAD_FILE_TTL_SECONDS) -> None:
+    """Удалить файлы в DOWNLOAD_DIR старше max_age_seconds.
+
+    Копия видео уже отправлена пользователю в чат, локальная версия нужна
+    только на случай ручной проверки/восстановления, поэтому старые файлы
+    можно спокойно чистить, чтобы диск не забивался бесконечно.
+    """
+    now = time.time()
+    for f in DOWNLOAD_DIR.iterdir():
+        try:
+            if f.is_file() and now - f.stat().st_mtime > max_age_seconds:
+                f.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("Не удалось удалить старый файл %s", f)
 
 
 def build_ydl_opts(outtmpl: str | None = None) -> dict:
@@ -339,15 +361,37 @@ def transcode_iphone_compressed(
 
 
 def _compress_with_margins(filepath: Path) -> tuple[Path, bool]:
-    """Несколько попыток сжатия с нарастающим запасом под лимит Telegram."""
-    duration = probe_media_file(filepath).get("duration_seconds")
-    transcode_ok = True
-    for margin in (0.95, 0.80, 0.60):
-        target = int(TELEGRAM_SEND_LIMIT_BYTES * margin)
-        filepath, ok = transcode_iphone_compressed(filepath, target, duration=duration)
-        transcode_ok = transcode_ok and ok
-        if filepath.stat().st_size <= TELEGRAM_SEND_LIMIT_BYTES:
-            break
+    """Сжать видео под лимит Telegram, подобрав запас по фактическому превышению.
+
+    Раньше здесь была "лесенка" из трёх фиксированных margin'ов (0.95, 0.80,
+    0.60), которая при сильно превышающем лимит файле почти гарантированно
+    требовала 2-3 полных перекодирования подряд — а это самая дорогая по CPU
+    операция во всём боте. Вместо этого сразу оцениваем нужный запас по
+    отношению текущего размера файла к лимиту и берём его с одной попытки;
+    вторая попытка остаётся только как редкий fallback, если расчётный
+    битрейт всё равно не уложился (например, из-за постоянных накладных
+    расходов контейнера на коротких, но "тяжёлых" по деталям роликах).
+    """
+    media = probe_media_file(filepath)
+    duration = media.get("duration_seconds")
+    size = filepath.stat().st_size
+
+    overshoot = size / TELEGRAM_SEND_LIMIT_BYTES
+    if overshoot < 1.3:
+        margin = 0.95
+    elif overshoot < 2:
+        margin = 0.85
+    else:
+        margin = 0.65
+
+    target = int(TELEGRAM_SEND_LIMIT_BYTES * margin)
+    filepath, transcode_ok = transcode_iphone_compressed(filepath, target, duration=duration)
+
+    if filepath.stat().st_size > TELEGRAM_SEND_LIMIT_BYTES:
+        fallback_target = int(TELEGRAM_SEND_LIMIT_BYTES * 0.6)
+        filepath, ok2 = transcode_iphone_compressed(filepath, fallback_target, duration=duration)
+        transcode_ok = transcode_ok and ok2
+
     return filepath, transcode_ok
 
 
@@ -480,6 +524,8 @@ async def run_download_and_send(
     prefetched_info: dict | None = None,
 ) -> None:
     """Скачать видео и отправить его в чат, обновляя статусное сообщение."""
+    await asyncio.to_thread(_cleanup_old_downloads)
+
     if DOWNLOAD_SEMAPHORE.locked():
         await status_msg.edit_text(
             "⏳ Сервер уже занят другой загрузкой, ваш запрос встал в очередь..."
