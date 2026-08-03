@@ -184,11 +184,27 @@ def _cleanup_old_downloads(max_age_seconds: int = DOWNLOAD_FILE_TTL_SECONDS) -> 
 
 
 def _make_ytdlp_progress_hook(tracker: "ProgressTracker"):
-    """Хук для yt-dlp: пишет процент и скорость скачивания в tracker."""
+    """Хук для yt-dlp: пишет процент и скорость скачивания в tracker.
+
+    yt-dlp вызывает этот хук на каждый прочитанный чанк — на быстром
+    соединении это могут быть десятки-сотни вызовов в секунду. Каждый вызов
+    сам по себе дешёвый (форматирование строки + lock), но при таком темпе
+    внутри потока, который параллельно читает сеть, накладные расходы
+    становятся заметны. Пользователь всё равно не видит обновления чаще,
+    чем раз в 2.5 сек (см. _report_progress), поэтому пишем в tracker не
+    чаще throttle_seconds.
+    """
+    last_update = 0.0
+    throttle_seconds = 0.5
 
     def hook(d: dict) -> None:
+        nonlocal last_update
         status = d.get("status")
         if status == "downloading":
+            now = time.monotonic()
+            if now - last_update < throttle_seconds:
+                return
+            last_update = now
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             downloaded = d.get("downloaded_bytes") or 0
             speed = d.get("speed") or 0
@@ -268,7 +284,7 @@ def probe_media_file(filepath: Path) -> dict:
                 "ffprobe", "-v", "error",
                 "-show_entries",
                 "stream=index,codec_type,codec_name,profile,pix_fmt,level,"
-                "r_frame_rate,avg_frame_rate,start_time,width,height",
+                "r_frame_rate,avg_frame_rate,start_time,width,height:"
                 "format=duration,format_name",
                 "-of", "json",
                 str(filepath),
@@ -427,7 +443,7 @@ def ensure_iphone_compatible(
     """
     output_path = filepath.with_name(filepath.stem + "_h264.mp4")
     cmd = [
-        "ffmpeg", "-y", "-i", str(filepath),
+        "ffmpeg", "-y", "-v", "error", "-i", str(filepath),
         *_iphone_video_base_args(),
         "-preset", "fast", "-crf", "23",
         *_iphone_audio_args(),
@@ -462,7 +478,7 @@ def transcode_iphone_compressed(
 
     output_path = filepath.with_name(filepath.stem + "_h264.mp4")
     cmd = [
-        "ffmpeg", "-y", "-i", str(filepath),
+        "ffmpeg", "-y", "-v", "error", "-i", str(filepath),
         "-vf", "scale='min(1280,iw)':-2",
         *_iphone_video_base_args(),
         "-preset", "fast",
@@ -481,6 +497,7 @@ def transcode_iphone_compressed(
 def _compress_with_margins(
     filepath: Path,
     tracker: "ProgressTracker | None" = None,
+    duration: float | None = None,
 ) -> tuple[Path, bool]:
     """Сжать видео под лимит Telegram, подобрав запас по фактическому превышению.
 
@@ -492,9 +509,13 @@ def _compress_with_margins(
     вторая попытка остаётся только как редкий fallback, если расчётный
     битрейт всё равно не уложился (например, из-за постоянных накладных
     расходов контейнера на коротких, но "тяжёлых" по деталям роликах).
+
+    duration можно передать, если она уже известна вызывающему коду — тогда
+    не тратим лишний вызов ffprobe (~0.1-0.3 сек, но их набегает несколько
+    подряд на одно видео) на то, что и так уже посчитано.
     """
-    media = probe_media_file(filepath)
-    duration = media.get("duration_seconds")
+    if duration is None:
+        duration = probe_media_file(filepath).get("duration_seconds")
     size = filepath.stat().st_size
 
     overshoot = size / TELEGRAM_SEND_LIMIT_BYTES
@@ -549,17 +570,23 @@ def download_video(
     filepath = Path(filename)
     was_compressed = False
 
+    # Один probe сразу после скачивания: даёт duration для прогресса/расчёта
+    # битрейта, и не приходится пере-пробовать тот же файл в каждой ветке ниже.
+    duration = probe_media_file(filepath).get("duration_seconds")
+
     if filepath.stat().st_size > TELEGRAM_SEND_LIMIT_BYTES:
-        filepath, transcode_ok = _compress_with_margins(filepath, tracker=tracker)
+        filepath, transcode_ok = _compress_with_margins(filepath, tracker=tracker, duration=duration)
         was_compressed = True
     else:
-        duration = probe_media_file(filepath).get("duration_seconds")
         filepath, transcode_ok = ensure_iphone_compatible(filepath, tracker=tracker, duration=duration)
         if filepath.stat().st_size > TELEGRAM_SEND_LIMIT_BYTES:
-            filepath, compress_ok = _compress_with_margins(filepath, tracker=tracker)
+            filepath, compress_ok = _compress_with_margins(filepath, tracker=tracker, duration=duration)
             transcode_ok = transcode_ok and compress_ok
             was_compressed = True
 
+    # Финальный probe нужен отдельно: ensure_iphone_compatible/_compress_with_margins
+    # перезаписывают filepath новым файлом, и его реальные width/height/has_audio
+    # нужны для send_video — их нельзя переиспользовать из probe'а выше.
     media = probe_media_file(filepath)
     return filepath, media["has_audio"], transcode_ok, media, was_compressed
 
