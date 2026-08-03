@@ -111,8 +111,9 @@ if _cookies_b64:
 
 # В памяти храним ссылки, ожидающие подтверждения пользователя (когда видео
 # доступно только без звука). Ключ — короткий случайный id для callback_data,
-# значение — (url, время_создания), чтобы можно было чистить протухшие записи.
-PENDING_DOWNLOADS: dict[str, tuple[str, float]] = {}
+# значение — (url, время_создания, метаданные yt-dlp), чтобы при подтверждении
+# не делать повторный extract_info и можно было чистить протухшие записи.
+PENDING_DOWNLOADS: dict[str, tuple[str, float, dict]] = {}
 PENDING_DOWNLOAD_TTL_SECONDS = 15 * 60  # неподтверждённые ссылки живут 15 минут
 
 # Ограничение на число одновременных скачиваний/перекодирований. Каждое из
@@ -127,7 +128,7 @@ def _cleanup_pending_downloads() -> None:
     """Удалить протухшие неподтверждённые ссылки, чтобы словарь не рос бесконечно."""
     now = time.monotonic()
     expired = [
-        cid for cid, (_, created_at) in PENDING_DOWNLOADS.items()
+        cid for cid, (_, created_at, _) in PENDING_DOWNLOADS.items()
         if now - created_at > PENDING_DOWNLOAD_TTL_SECONDS
     ]
     for cid in expired:
@@ -167,12 +168,11 @@ def build_ydl_opts(outtmpl: str | None = None) -> dict:
     return opts
 
 
-def probe_has_audio(url: str) -> bool:
-    """Проверить (без скачивания видео), будет ли у итогового файла звук."""
+def fetch_video_info(url: str) -> dict:
+    """Получить метаданные видео через yt-dlp без скачивания."""
     ydl_opts = build_ydl_opts()
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-    return _info_has_audio(info)
+        return ydl.extract_info(url, download=False)
 
 
 def _info_has_audio(info: dict) -> bool:
@@ -182,75 +182,52 @@ def _info_has_audio(info: dict) -> bool:
     return True
 
 
-def _log_stream_diagnostics(filepath: Path) -> None:
-    """Записать в лог полные параметры видео/аудио потоков файла.
-
-    Это не влияет на работу бота, а нужно только для диагностики: если
-    какое-то видео всё же не заиграет на iPhone, в логах будет видно
-    codec/profile/pix_fmt/framerate и т.д. этого конкретного файла, и
-    можно будет прицельно расширить логику перекодирования вместо
-    гадания вслепую.
-    """
+def probe_media_file(filepath: Path) -> dict:
+    """Один вызов ffprobe: метаданные для send_video, аудио и диагностика."""
+    result: dict = {
+        "width": None,
+        "height": None,
+        "duration": None,
+        "duration_seconds": None,
+        "has_audio": True,
+    }
     try:
         probe = subprocess.run(
             [
                 "ffprobe", "-v", "error",
                 "-show_entries",
                 "stream=index,codec_type,codec_name,profile,pix_fmt,level,"
-                "r_frame_rate,avg_frame_rate,start_time:format=duration,format_name",
+                "r_frame_rate,avg_frame_rate,start_time,width,height",
+                "format=duration,format_name",
                 "-of", "json",
                 str(filepath),
             ],
             capture_output=True, text=True, timeout=30,
         )
         logger.info("Диагностика потоков %s: %s", filepath.name, probe.stdout.strip())
+        data = json.loads(probe.stdout)
+        has_audio = False
+        for stream in data.get("streams") or []:
+            if stream.get("codec_type") == "video" and result["width"] is None:
+                result["width"] = stream.get("width")
+                result["height"] = stream.get("height")
+            if stream.get("codec_type") == "audio":
+                has_audio = True
+        result["has_audio"] = has_audio
+        duration = (data.get("format") or {}).get("duration")
+        if duration:
+            result["duration_seconds"] = float(duration)
+            result["duration"] = int(float(duration))
     except Exception:
-        logger.exception("Не удалось получить диагностику потоков для %s", filepath)
+        logger.exception("Не удалось проанализировать файл %s", filepath)
+    return result
 
 
-def ensure_iphone_compatible(filepath: Path) -> tuple[Path, bool]:
-    """Гарантированно привести видео к формату, который играет на iPhone.
-
-    Раньше здесь стояла эвристика ("перекодировать, только если кодек/
-    профиль/pix_fmt выглядят подозрительно"), но практика показала, что
-    список причин, из-за которых iOS-декодер Telegram отказывается
-    декодировать видео (застревает на первом кадре при играющем звуке),
-    шире, чем можно надёжно перечислить: сюда попадают не только 10-bit/
-    4:4:4/4:2:2, но и fragmented mp4 без полноценного moov, переменный
-    frame rate (VFR), нестандартный порядок B-кадров после `-c copy`
-    мёржа видео+аудио и т.п. Пытаться детектировать каждый случай
-    отдельно — гонка с новыми источниками. Поэтому теперь ролик всегда
-    безусловно перекодируется в заведомо совместимый профиль: H.264
-    High@4.1, 8-bit, 4:2:0, постоянный frame rate, AAC, moov в начале
-    файла. Это чуть дороже по CPU, зато исключает целый класс багов.
-    """
-    _log_stream_diagnostics(filepath)
-
-    output_path = filepath.with_name(filepath.stem + "_h264.mp4")
+def _run_ffmpeg(cmd: list[str], filepath: Path, output_path: Path, timeout: int) -> tuple[Path, bool]:
+    """Запустить ffmpeg и вернуть (путь_к_файлу, успех)."""
     try:
-        result = subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", str(filepath),
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-profile:v", "high", "-level", "5.1",
-                "-pix_fmt", "yuv420p",
-                "-fps_mode", "cfr",
-                "-threads", FFMPEG_THREADS,
-                "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-                "-fflags", "+genpts",
-                "-avoid_negative_ts", "make_zero",
-                "-max_muxing_queue_size", "1024",
-                "-movflags", "+faststart",
-                str(output_path),
-            ],
-            capture_output=True, text=True, timeout=300,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError:
-        # Самая коварная причина "перекодировка ничего не изменила":
-        # ffmpeg просто не найден в PATH процесса бота (например, бот
-        # запущен в окружении/контейнере без установленного ffmpeg, или
-        # PATH урезан systemd/supervisor'ом). Тогда КАЖДЫЙ вызов сюда
-        # молча проваливался бы и всегда отправлялся сырой файл.
         logger.error(
             "ffmpeg не найден в PATH — перекодировка невозможна ни для одного "
             "видео. Проверьте, что ffmpeg установлен и доступен процессу бота "
@@ -258,7 +235,7 @@ def ensure_iphone_compatible(filepath: Path) -> tuple[Path, bool]:
         )
         return filepath, False
     except subprocess.TimeoutExpired:
-        logger.error("Перекодировка %s превысила таймаут 300с; отправляю как есть.", filepath)
+        logger.error("Перекодировка %s превысила таймаут %ss; отправляю как есть.", filepath, timeout)
         return filepath, False
 
     if result.returncode != 0:
@@ -281,74 +258,110 @@ def ensure_iphone_compatible(filepath: Path) -> tuple[Path, bool]:
     return output_path, True
 
 
-def get_video_metadata(filepath: Path) -> dict:
-    """Получить реальные width/height/duration видео через ffprobe.
+def _iphone_audio_args() -> list[str]:
+    return ["-c:a", "aac", "-b:a", "128k", "-ar", "44100"]
 
-    Явная передача этих значений в send_video помогает Telegram сразу
-    показать видео с правильными пропорциями (без этого иногда до полной
-    обработки файла превью показывается квадратным, особенно для
-    вертикальных Reels).
+
+def _iphone_video_base_args() -> list[str]:
+    return [
+        "-c:v", "libx264",
+        "-profile:v", "high", "-level", "5.1",
+        "-pix_fmt", "yuv420p",
+        "-fps_mode", "cfr",
+        "-threads", FFMPEG_THREADS,
+        "-fflags", "+genpts",
+        "-avoid_negative_ts", "make_zero",
+        "-max_muxing_queue_size", "1024",
+        "-movflags", "+faststart",
+    ]
+
+
+def ensure_iphone_compatible(filepath: Path) -> tuple[Path, bool]:
+    """Гарантированно привести видео к формату, который играет на iPhone.
+
+    Раньше здесь стояла эвристика ("перекодировать, только если кодек/
+    профиль/pix_fmt выглядят подозрительно"), но практика показала, что
+    список причин, из-за которых iOS-декодер Telegram отказывается
+    декодировать видео (застревает на первом кадре при играющем звуке),
+    шире, чем можно надёжно перечислить: сюда попадают не только 10-bit/
+    4:4:4/4:2:2, но и fragmented mp4 без полноценного moov, переменный
+    frame rate (VFR), нестандартный порядок B-кадров после `-c copy`
+    мёржа видео+аудио и т.п. Пытаться детектировать каждый случай
+    отдельно — гонка с новыми источниками. Поэтому теперь ролик всегда
+    безусловно перекодируется в заведомо совместимый профиль: H.264
+    High@4.1, 8-bit, 4:2:0, постоянный frame rate, AAC, moov в начале
+    файла. Это чуть дороже по CPU, зато исключает целый класс багов.
     """
-    result = {"width": None, "height": None, "duration": None}
-    try:
-        probe = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height:format=duration",
-                "-of", "json",
-                str(filepath),
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        data = json.loads(probe.stdout)
-        stream = (data.get("streams") or [{}])[0]
-        result["width"] = stream.get("width")
-        result["height"] = stream.get("height")
-        duration = (data.get("format") or {}).get("duration")
-        if duration:
-            result["duration"] = int(float(duration))
-    except Exception:
-        logger.exception("Не удалось получить метаданные видео для %s", filepath)
-    return result
+    output_path = filepath.with_name(filepath.stem + "_h264.mp4")
+    cmd = [
+        "ffmpeg", "-y", "-i", str(filepath),
+        *_iphone_video_base_args(),
+        "-preset", "fast", "-crf", "23",
+        *_iphone_audio_args(),
+        str(output_path),
+    ]
+    return _run_ffmpeg(cmd, filepath, output_path, timeout=300)
 
 
-def file_has_audio_stream(filepath: Path) -> bool:
-    """Проверить сам файл через ffprobe — есть ли в нём аудиодорожка.
+def transcode_iphone_compressed(
+    filepath: Path,
+    target_bytes: int,
+    duration: float | None = None,
+) -> tuple[Path, bool]:
+    """Перекодировать в iPhone-совместимый формат и уложиться в target_bytes.
 
-    Это надёжнее, чем судить по метаданным yt-dlp (info dict), которые
-    иногда не отражают, что реально оказалось в файле после склейки/
-    перекодирования.
+    Объединяет ensure_iphone_compatible и compress_to_fit в один проход
+    ffmpeg, сохраняя все настройки совместимости с iOS.
     """
-    try:
-        probe = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-select_streams", "a",
-                "-show_entries", "stream=index",
-                "-of", "csv=p=0",
-                str(filepath),
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        return bool(probe.stdout.strip())
-    except Exception:
-        logger.exception("Не удалось проверить аудиодорожку через ffprobe для %s", filepath)
-        # Если проверить не удалось — не пугаем пользователя ложным
-        # предупреждением об отсутствии звука.
-        return True
+    if duration is None:
+        duration = probe_media_file(filepath).get("duration_seconds")
+    if not duration or duration <= 0:
+        logger.warning("Не удалось получить длительность %s; сжатие пропущено.", filepath)
+        return filepath, False
+
+    audio_bitrate_kbps = 128
+    target_total_kbps = (target_bytes * 8 / 1000) / duration * 0.95
+    video_bitrate_kbps = max(int(target_total_kbps - audio_bitrate_kbps), 100)
+
+    output_path = filepath.with_name(filepath.stem + "_h264.mp4")
+    cmd = [
+        "ffmpeg", "-y", "-i", str(filepath),
+        "-vf", "scale='min(1280,iw)':-2",
+        *_iphone_video_base_args(),
+        "-preset", "fast",
+        "-b:v", f"{video_bitrate_kbps}k",
+        "-maxrate", f"{video_bitrate_kbps}k",
+        "-bufsize", f"{video_bitrate_kbps * 2}k",
+        *_iphone_audio_args(),
+        str(output_path),
+    ]
+    return _run_ffmpeg(cmd, filepath, output_path, timeout=600)
 
 
-def download_video(url: str, user_id: int) -> tuple[Path, bool, bool]:
+def _compress_with_margins(filepath: Path) -> tuple[Path, bool]:
+    """Несколько попыток сжатия с нарастающим запасом под лимит Telegram."""
+    duration = probe_media_file(filepath).get("duration_seconds")
+    transcode_ok = True
+    for margin in (0.95, 0.80, 0.60):
+        target = int(TELEGRAM_SEND_LIMIT_BYTES * margin)
+        filepath, ok = transcode_iphone_compressed(filepath, target, duration=duration)
+        transcode_ok = transcode_ok and ok
+        if filepath.stat().st_size <= TELEGRAM_SEND_LIMIT_BYTES:
+            break
+    return filepath, transcode_ok
+
+
+def download_video(
+    url: str,
+    user_id: int,
+    prefetched_info: dict | None = None,
+) -> tuple[Path, bool, bool, dict, bool]:
     """Скачать `url` через yt-dlp.
 
-    Возвращает (путь_к_файлу, has_audio, transcode_ok). has_audio
-    определяется по реальному итоговому файлу (через ffprobe), а не по
-    метаданным yt-dlp, которые не всегда точно отражают результат.
-    transcode_ok == False означает, что перекодировка в совместимый с
-    iPhone формат не удалась и пользователю уйдёт исходный файл как есть
-    — в таком случае проблемы с воспроизведением на iPhone ожидаемы, и
-    подробности будут в логах (см. ensure_iphone_compatible).
+    Возвращает (путь_к_файлу, has_audio, transcode_ok, media, was_compressed).
+    has_audio определяется по реальному итоговому файлу (через ffprobe).
+    prefetched_info — метаданные из fetch_video_info, чтобы не вызывать
+    extract_info повторно при скачивании.
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     outtmpl = str(DOWNLOAD_DIR / f"{user_id}_{timestamp}_%(title).50s.%(ext)s")
@@ -356,12 +369,28 @@ def download_video(url: str, user_id: int) -> tuple[Path, bool, bool]:
     ydl_opts = build_ydl_opts(outtmpl)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+        if prefetched_info is not None:
+            info = prefetched_info
+            ydl.process_info(info)
+        else:
+            info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
 
-    filepath, transcode_ok = ensure_iphone_compatible(Path(filename))
-    has_audio = file_has_audio_stream(filepath)
-    return filepath, has_audio, transcode_ok
+    filepath = Path(filename)
+    was_compressed = False
+
+    if filepath.stat().st_size > TELEGRAM_SEND_LIMIT_BYTES:
+        filepath, transcode_ok = _compress_with_margins(filepath)
+        was_compressed = True
+    else:
+        filepath, transcode_ok = ensure_iphone_compatible(filepath)
+        if filepath.stat().st_size > TELEGRAM_SEND_LIMIT_BYTES:
+            filepath, compress_ok = _compress_with_margins(filepath)
+            transcode_ok = transcode_ok and compress_ok
+            was_compressed = True
+
+    media = probe_media_file(filepath)
+    return filepath, media["has_audio"], transcode_ok, media, was_compressed
 
 
 
@@ -388,7 +417,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     status_msg = await update.message.reply_text("🔍 Проверяю видео...")
 
     try:
-        has_audio = await asyncio.to_thread(probe_has_audio, url)
+        info = await asyncio.to_thread(fetch_video_info, url)
+        has_audio = _info_has_audio(info)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Не удалось проверить ссылку %s", url)
         await status_msg.edit_text(f"❌ Не удалось обработать ссылку.\nПричина: {exc}")
@@ -396,13 +426,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if has_audio:
         await status_msg.edit_text("⏳ Скачиваю видео...")
-        await run_download_and_send(status_msg, url, update.effective_user.id)
+        await run_download_and_send(status_msg, url, update.effective_user.id, prefetched_info=info)
         return
 
     # Звука нет — спрашиваем подтверждение через кнопки
     _cleanup_pending_downloads()
     callback_id = uuid.uuid4().hex[:12]
-    PENDING_DOWNLOADS[callback_id] = (url, time.monotonic())
+    PENDING_DOWNLOADS[callback_id] = (url, time.monotonic(), info)
 
     keyboard = InlineKeyboardMarkup(
         [
@@ -433,79 +463,22 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    url, _created_at = pending
+    url, _created_at, info = pending
 
     if action == "dl_no":
         await query.edit_message_text("Отменено. Можете прислать другую ссылку.")
         return
 
     await query.edit_message_text("⏳ Скачиваю видео...")
-    await run_download_and_send(query.message, url, query.from_user.id)
+    await run_download_and_send(query.message, url, query.from_user.id, prefetched_info=info)
 
 
-def _get_duration_seconds(filepath: Path) -> float | None:
-    try:
-        probe = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "csv=p=0",
-                str(filepath),
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        return float(probe.stdout.strip())
-    except Exception:
-        logger.exception("Не удалось определить длительность видео для %s", filepath)
-        return None
-
-
-def compress_to_fit(filepath: Path, target_bytes: int) -> Path:
-    """Сжать видео так, чтобы оно уместилось в target_bytes.
-
-    Битрейт рассчитывается исходя из длительности ролика с небольшим
-    запасом (5%), чтобы гарантированно попасть под лимит Telegram, а не
-    просто приблизиться к нему.
-    """
-    duration = _get_duration_seconds(filepath)
-    if not duration or duration <= 0:
-        logger.warning("Не удалось получить длительность %s; сжатие пропущено.", filepath)
-        return filepath
-
-    audio_bitrate_kbps = 128
-    # 5% запаса, т.к. реальный размер файла обычно чуть больше расчётного
-    target_total_kbps = (target_bytes * 8 / 1000) / duration * 0.95
-    video_bitrate_kbps = max(int(target_total_kbps - audio_bitrate_kbps), 100)
-
-    output_path = filepath.with_name(filepath.stem + "_compressed.mp4")
-    try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", str(filepath),
-                # Ограничиваем ширину 1280px (720p) — на маленьких серверах
-                # (мало RAM) кодирование полного 1080p+ видео может вызвать
-                # OOM-убийство процесса (SIGKILL). Понижение разрешения
-                # заметно снижает потребление памяти при кодировании.
-                "-vf", "scale='min(1280,iw)':-2",
-                "-c:v", "libx264", "-preset", "veryfast",
-                "-b:v", f"{video_bitrate_kbps}k",
-                "-maxrate", f"{video_bitrate_kbps}k",
-                "-bufsize", f"{video_bitrate_kbps * 2}k",
-                "-c:a", "aac", "-b:a", f"{audio_bitrate_kbps}k",
-                "-movflags", "+faststart",
-                str(output_path),
-            ],
-            check=True, capture_output=True, timeout=600,
-        )
-    except Exception:
-        logger.exception("Не удалось сжать %s; отправляю оригинал.", filepath)
-        return filepath
-
-    filepath.unlink(missing_ok=True)
-    return output_path
-
-
-async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> None:
+async def run_download_and_send(
+    status_msg: Message,
+    url: str,
+    user_id: int,
+    prefetched_info: dict | None = None,
+) -> None:
     """Скачать видео и отправить его в чат, обновляя статусное сообщение."""
     if DOWNLOAD_SEMAPHORE.locked():
         await status_msg.edit_text(
@@ -514,31 +487,15 @@ async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> 
 
     async with DOWNLOAD_SEMAPHORE:
         try:
-            filepath, has_audio, transcode_ok = await asyncio.to_thread(download_video, url, user_id)
+            filepath, has_audio, transcode_ok, media, was_compressed = await asyncio.to_thread(
+                download_video, url, user_id, prefetched_info
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Не удалось скачать %s", url)
             await status_msg.edit_text(f"❌ Не удалось скачать это видео.\nПричина: {exc}")
             return
 
         size = filepath.stat().st_size
-        was_compressed = False
-
-        if size > TELEGRAM_SEND_LIMIT_BYTES:
-            await status_msg.edit_text(
-                f"🗜 Видео весит {size / 1_048_576:.1f} МБ — это больше лимита "
-                "Telegram (50 МБ). Сжимаю..."
-            )
-            # Несколько попыток со всё более сильным сжатием (запас растёт
-            # каждый раз), на случай если реальный размер после кодирования
-            # всё равно окажется больше расчётного.
-            for margin in (0.95, 0.80, 0.60):
-                filepath = await asyncio.to_thread(
-                    compress_to_fit, filepath, target_bytes=int(TELEGRAM_SEND_LIMIT_BYTES * margin)
-                )
-                size = filepath.stat().st_size
-                if size <= TELEGRAM_SEND_LIMIT_BYTES:
-                    break
-            was_compressed = size <= TELEGRAM_SEND_LIMIT_BYTES
 
     await status_msg.edit_text(f"✅ Сохранено: {filepath.name} ({size / 1_048_576:.1f} МБ)")
 
@@ -562,16 +519,15 @@ async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> 
                 "качество немного ниже оригинала."
             )
         caption = "\n\n".join(notes) or None
-        meta = await asyncio.to_thread(get_video_metadata, filepath)
 
         with filepath.open("rb") as video_file:
             await status_msg.get_bot().send_video(
                 chat_id=status_msg.chat_id,
                 video=video_file,
                 caption=caption,
-                width=meta["width"],
-                height=meta["height"],
-                duration=meta["duration"],
+                width=media["width"],
+                height=media["height"],
+                duration=media["duration"],
                 supports_streaming=True,
             )
     else:
