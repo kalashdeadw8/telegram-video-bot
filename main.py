@@ -134,8 +134,12 @@ def _cleanup_pending_downloads() -> None:
         PENDING_DOWNLOADS.pop(cid, None)
 
 
-def build_ydl_opts(outtmpl: str | None = None) -> dict:
-    """Собрать общие опции yt-dlp (формат, cookies, прокси)."""
+def build_ydl_opts(outtmpl: str | None = None, use_cookies: bool = True) -> dict:
+    """Собрать общие опции yt-dlp (формат, cookies, прокси).
+
+    use_cookies=False собирает опции без cookiefile — используется для
+    первой, "анонимной" попытки запроса в extract_with_fallback.
+    """
     opts: dict = {
         "format": YDL_FORMAT,
         "merge_output_format": "mp4",
@@ -154,7 +158,7 @@ def build_ydl_opts(outtmpl: str | None = None) -> dict:
     if outtmpl:
         opts["outtmpl"] = outtmpl
 
-    if COOKIES_FILE.exists():
+    if use_cookies and COOKIES_FILE.exists():
         opts["cookiefile"] = str(COOKIES_FILE)
 
     # Опциональный прокси (например, резидентный), если запросы с IP
@@ -167,11 +171,31 @@ def build_ydl_opts(outtmpl: str | None = None) -> dict:
     return opts
 
 
+def extract_with_fallback(url: str, download: bool, outtmpl: str | None = None):
+    """Сначала попробовать без cookies, и только при ошибке — с cookies.
+
+    У Instagram/YouTube бывают периоды нестабильности именно в
+    "залогиненном" (с cookies) пути запроса, при этом обычный контент
+    прекрасно извлекается анонимно. Поэтому cookies используем только как
+    запасной вариант, а не всегда — так основная масса видео не спотыкается
+    об эту нестабильность там, где cookies вообще не нужны.
+    """
+    try:
+        ydl_opts = build_ydl_opts(outtmpl, use_cookies=False)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=download)
+    except Exception as exc_no_cookies:
+        if not COOKIES_FILE.exists():
+            raise
+        logger.info("Запрос без cookies не удался (%s), пробую с cookies...", exc_no_cookies)
+        ydl_opts = build_ydl_opts(outtmpl, use_cookies=True)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=download)
+
+
 def probe_has_audio(url: str) -> bool:
     """Проверить (без скачивания видео), будет ли у итогового файла звук."""
-    ydl_opts = build_ydl_opts()
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    info = extract_with_fallback(url, download=False)
     return _info_has_audio(info)
 
 
@@ -353,10 +377,12 @@ def download_video(url: str, user_id: int) -> tuple[Path, bool, bool]:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     outtmpl = str(DOWNLOAD_DIR / f"{user_id}_{timestamp}_%(title).50s.%(ext)s")
 
-    ydl_opts = build_ydl_opts(outtmpl)
+    info = extract_with_fallback(url, download=True, outtmpl=outtmpl)
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    # prepare_filename только форматирует outtmpl по данным info — cookies
+    # для этого не нужны, поэтому подходит любой экземпляр YoutubeDL с тем
+    # же outtmpl.
+    with yt_dlp.YoutubeDL(build_ydl_opts(outtmpl, use_cookies=False)) as ydl:
         filename = ydl.prepare_filename(info)
 
     filepath, transcode_ok = ensure_iphone_compatible(Path(filename))
