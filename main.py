@@ -38,6 +38,7 @@ import subprocess
 import time
 import uuid
 from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -111,8 +112,19 @@ if _cookies_b64:
 
 # В памяти храним ссылки, ожидающие подтверждения пользователя (когда видео
 # доступно только без звука). Ключ — короткий случайный id для callback_data,
-# значение — (url, время_создания), чтобы можно было чистить протухшие записи.
-PENDING_DOWNLOADS: dict[str, tuple[str, float]] = {}
+# значение — ссылка, пользователь, чат и время создания, чтобы нельзя было
+# подтвердить чужую загрузку и чтобы можно было чистить протухшие записи.
+@dataclass(frozen=True)
+class PendingDownload:
+    """Ожидающее подтверждение скачивание, привязанное к чату и пользователю."""
+
+    url: str
+    user_id: int
+    chat_id: int
+    created_at: float
+
+
+PENDING_DOWNLOADS: dict[str, PendingDownload] = {}
 PENDING_DOWNLOAD_TTL_SECONDS = 15 * 60  # неподтверждённые ссылки живут 15 минут
 
 # Ограничение на число одновременных скачиваний/перекодирований. Каждое из
@@ -127,8 +139,8 @@ def _cleanup_pending_downloads() -> None:
     """Удалить протухшие неподтверждённые ссылки, чтобы словарь не рос бесконечно."""
     now = time.monotonic()
     expired = [
-        cid for cid, (_, created_at) in PENDING_DOWNLOADS.items()
-        if now - created_at > PENDING_DOWNLOAD_TTL_SECONDS
+        cid for cid, pending in PENDING_DOWNLOADS.items()
+        if now - pending.created_at > PENDING_DOWNLOAD_TTL_SECONDS
     ]
     for cid in expired:
         PENDING_DOWNLOADS.pop(cid, None)
@@ -413,11 +425,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     url = match.group(0)
     status_msg = await update.message.reply_text("🔍 Проверяю видео...")
 
+    if DOWNLOAD_SEMAPHORE.locked():
+        await status_msg.edit_text("⏳ Сервер занят, запрос поставлен в очередь на проверку...")
+
     try:
-        has_audio = await asyncio.to_thread(probe_has_audio, url)
-    except Exception as exc:  # noqa: BLE001
+        # Проверка через yt-dlp тоже выполняет сетевые и CPU-затратные операции,
+        # поэтому ограничиваем её тем же семафором, что и скачивание.
+        async with DOWNLOAD_SEMAPHORE:
+            has_audio = await asyncio.to_thread(probe_has_audio, url)
+    except Exception:  # noqa: BLE001
         logger.exception("Не удалось проверить ссылку %s", url)
-        await status_msg.edit_text(f"❌ Не удалось обработать ссылку.\nПричина: {exc}")
+        await status_msg.edit_text(
+            "❌ Не удалось обработать ссылку. Возможно, она недоступна "
+            "или сервис временно ограничил доступ."
+        )
         return
 
     if has_audio:
@@ -428,7 +449,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Звука нет — спрашиваем подтверждение через кнопки
     _cleanup_pending_downloads()
     callback_id = uuid.uuid4().hex[:12]
-    PENDING_DOWNLOADS[callback_id] = (url, time.monotonic())
+    PENDING_DOWNLOADS[callback_id] = PendingDownload(
+        url=url,
+        user_id=update.effective_user.id,
+        chat_id=update.effective_chat.id,
+        created_at=time.monotonic(),
+    )
 
     keyboard = InlineKeyboardMarkup(
         [
@@ -448,18 +474,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
 
     action, _, callback_id = query.data.partition(":")
-    pending = PENDING_DOWNLOADS.pop(callback_id, None)
+    pending = PENDING_DOWNLOADS.get(callback_id)
 
-    if pending is None:
+    if (
+        pending is None
+        or time.monotonic() - pending.created_at > PENDING_DOWNLOAD_TTL_SECONDS
+    ):
+        PENDING_DOWNLOADS.pop(callback_id, None)
+        await query.answer()
         await query.edit_message_text(
             "⚠️ Это действие уже неактуально. Пришлите ссылку ещё раз."
         )
         return
 
-    url, _created_at = pending
+    if (
+        query.from_user.id != pending.user_id
+        or query.message.chat_id != pending.chat_id
+    ):
+        await query.answer("Эта кнопка предназначена другому пользователю.", show_alert=True)
+        return
+
+    PENDING_DOWNLOADS.pop(callback_id, None)
+    url = pending.url
+    await query.answer()
 
     if action == "dl_no":
         await query.edit_message_text("Отменено. Можете прислать другую ссылку.")
@@ -533,82 +572,90 @@ def compress_to_fit(filepath: Path, target_bytes: int) -> Path:
 
 async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> None:
     """Скачать видео и отправить его в чат, обновляя статусное сообщение."""
-    if DOWNLOAD_SEMAPHORE.locked():
-        await status_msg.edit_text(
-            "⏳ Сервер уже занят другой загрузкой, ваш запрос встал в очередь..."
-        )
-
-    async with DOWNLOAD_SEMAPHORE:
-        try:
-            filepath, has_audio, transcode_ok = await asyncio.to_thread(download_video, url, user_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Не удалось скачать %s", url)
-            await status_msg.edit_text(f"❌ Не удалось скачать это видео.\nПричина: {exc}")
-            return
-
-        size = filepath.stat().st_size
-        was_compressed = False
-
-        if size > TELEGRAM_SEND_LIMIT_BYTES:
+    filepath: Path | None = None
+    try:
+        if DOWNLOAD_SEMAPHORE.locked():
             await status_msg.edit_text(
-                f"🗜 Видео весит {size / 1_048_576:.1f} МБ — это больше лимита "
-                "Telegram (50 МБ). Сжимаю..."
+                "⏳ Сервер уже занят другой загрузкой, ваш запрос встал в очередь..."
             )
-            # Несколько попыток со всё более сильным сжатием (запас растёт
-            # каждый раз), на случай если реальный размер после кодирования
-            # всё равно окажется больше расчётного.
-            for margin in (0.95, 0.80, 0.60):
-                filepath = await asyncio.to_thread(
-                    compress_to_fit, filepath, target_bytes=int(TELEGRAM_SEND_LIMIT_BYTES * margin)
+
+        async with DOWNLOAD_SEMAPHORE:
+            try:
+                filepath, has_audio, transcode_ok = await asyncio.to_thread(download_video, url, user_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("Не удалось скачать %s", url)
+                await status_msg.edit_text(
+                    "❌ Не удалось скачать это видео. Возможно, ссылка недоступна "
+                    "или сервис временно ограничил доступ."
                 )
-                size = filepath.stat().st_size
-                if size <= TELEGRAM_SEND_LIMIT_BYTES:
-                    break
-            was_compressed = size <= TELEGRAM_SEND_LIMIT_BYTES
+                return
 
-    await status_msg.edit_text(f"✅ Сохранено: {filepath.name} ({size / 1_048_576:.1f} МБ)")
+            size = filepath.stat().st_size
+            was_compressed = False
 
-    if size <= TELEGRAM_SEND_LIMIT_BYTES:
-        notes = []
-        if not transcode_ok:
-            notes.append(
-                "⚠️ Не удалось привести видео к формату, совместимому с "
-                "iPhone (подробности в логах бота) — на iPhone это видео "
-                "может не воспроизводиться или зависать на первом кадре. "
-                "На Android/десктопе должно быть без проблем."
-            )
-        if not has_audio:
-            notes.append(
-                "🔇 Учтите: это видео скачалось без звука — у источника не "
-                "было доступной версии со звуком для этого контента."
-            )
-        if was_compressed:
-            notes.append(
-                "🗜 Видео было сжато, чтобы уместиться в лимит Telegram — "
-                "качество немного ниже оригинала."
-            )
-        caption = "\n\n".join(notes) or None
-        meta = await asyncio.to_thread(get_video_metadata, filepath)
+            if size > TELEGRAM_SEND_LIMIT_BYTES:
+                await status_msg.edit_text(
+                    f"🗜 Видео весит {size / 1_048_576:.1f} МБ — это больше лимита "
+                    "Telegram (50 МБ). Сжимаю..."
+                )
+                for margin in (0.95, 0.80, 0.60):
+                    filepath = await asyncio.to_thread(
+                        compress_to_fit, filepath, target_bytes=int(TELEGRAM_SEND_LIMIT_BYTES * margin)
+                    )
+                    size = filepath.stat().st_size
+                    if size <= TELEGRAM_SEND_LIMIT_BYTES:
+                        break
+                was_compressed = size <= TELEGRAM_SEND_LIMIT_BYTES
 
-        with filepath.open("rb") as video_file:
-            await status_msg.get_bot().send_video(
+        await status_msg.edit_text(f"✅ Сохранено: {filepath.name} ({size / 1_048_576:.1f} МБ)")
+
+        if size <= TELEGRAM_SEND_LIMIT_BYTES:
+            notes = []
+            if not transcode_ok:
+                notes.append(
+                    "⚠️ Не удалось привести видео к формату, совместимому с "
+                    "iPhone (подробности в логах бота) — на iPhone это видео "
+                    "может не воспроизводиться или зависать на первом кадре. "
+                    "На Android/десктопе должно быть без проблем."
+                )
+            if not has_audio:
+                notes.append(
+                    "🔇 Учтите: это видео скачалось без звука — у источника не "
+                    "было доступной версии со звуком для этого контента."
+                )
+            if was_compressed:
+                notes.append(
+                    "🗜 Видео было сжато, чтобы уместиться в лимит Telegram — "
+                    "качество немного ниже оригинала."
+                )
+            caption = "\n\n".join(notes) or None
+            meta = await asyncio.to_thread(get_video_metadata, filepath)
+
+            with filepath.open("rb") as video_file:
+                await status_msg.get_bot().send_video(
+                    chat_id=status_msg.chat_id,
+                    video=video_file,
+                    caption=caption,
+                    width=meta["width"],
+                    height=meta["height"],
+                    duration=meta["duration"],
+                    supports_streaming=True,
+                )
+        else:
+            await status_msg.get_bot().send_message(
                 chat_id=status_msg.chat_id,
-                video=video_file,
-                caption=caption,
-                width=meta["width"],
-                height=meta["height"],
-                duration=meta["duration"],
-                supports_streaming=True,
+                text=(
+                    "⚠️ Даже после сжатия видео больше лимита Telegram на "
+                    "отправку файлов ботом (50 МБ) — вероятно, ролик слишком "
+                    "длинный. К сожалению, прислать его в чат я не могу."
+                ),
             )
-    else:
-        await status_msg.get_bot().send_message(
-            chat_id=status_msg.chat_id,
-            text=(
-                "⚠️ Даже после сжатия видео больше лимита Telegram на "
-                "отправку файлов ботом (50 МБ) — вероятно, ролик слишком "
-                "длинный. К сожалению, прислать его в чат я не могу."
-            ),
-        )
+    finally:
+        if filepath is not None:
+            try:
+                filepath.unlink(missing_ok=True)
+            except OSError:
+                logger.exception("Не удалось удалить временный файл %s", filepath)
 
 
 # --------------------------------------------------------------------------- #
@@ -633,3 +680,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
+
