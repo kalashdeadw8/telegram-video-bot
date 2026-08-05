@@ -20,12 +20,9 @@ Reddit и сотни других сайтов, поддерживаемых yt-
 Примечания:
     - Telegram-боты могут ОТПРАВЛЯТЬ файлы обратно в чат размером не
       более 50 МБ (это ограничение самого Telegram Bot API, а не кода).
-      Более крупные видео всё равно сохраняются на сервере в
-      DOWNLOAD_DIR, пользователю просто сообщается, что файл слишком
-      большой для отправки.
-    - Видео сохраняются локально в DOWNLOAD_DIR с именем на основе
-      Telegram user id и метки времени, поэтому файлы не перезаписывают
-      друг друга.
+      Более крупные видео не могут быть отправлены пользователю.
+    - Каждая загрузка выполняется в отдельном временном каталоге внутри
+      DOWNLOAD_DIR. После обработки этот каталог удаляется.
 """
 
 import asyncio
@@ -34,10 +31,10 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 import uuid
-from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,6 +60,12 @@ DOWNLOAD_DIR = Path(__file__).parent / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 TELEGRAM_SEND_LIMIT_BYTES = 50 * 1024 * 1024  # лимит Bot API на отправку файла
+# Не даём одной заявке часами удерживать очередь и заполнять диск. Значение 0
+# отключает ограничение; для обычных роликов получаса достаточно.
+MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "1800"))
+TRANSCODE_TIMEOUT_SECONDS = int(os.environ.get("TRANSCODE_TIMEOUT_SECONDS", "300"))
+COMPRESSION_TIMEOUT_SECONDS = int(os.environ.get("COMPRESSION_TIMEOUT_SECONDS", "300"))
+COMPRESSION_MARGINS = (0.90, 0.65)
 
 # Без явного лимита ffmpeg сам определяет число потоков кодирования по
 # количеству ядер, которое видит в системе. На многих PaaS-хостингах
@@ -205,10 +208,14 @@ def extract_with_fallback(url: str, download: bool, outtmpl: str | None = None):
             return ydl.extract_info(url, download=download)
 
 
-def probe_has_audio(url: str) -> bool:
-    """Проверить (без скачивания видео), будет ли у итогового файла звук."""
+def probe_video(url: str) -> tuple[bool, float | None]:
+    """Проверить наличие звука и длительность ролика без его скачивания."""
     info = extract_with_fallback(url, download=False)
-    return _info_has_audio(info)
+    duration = info.get("duration")
+    try:
+        return _info_has_audio(info), float(duration) if duration is not None else None
+    except (TypeError, ValueError):
+        return _info_has_audio(info), None
 
 
 def _info_has_audio(info: dict) -> bool:
@@ -268,7 +275,7 @@ def ensure_iphone_compatible(filepath: Path) -> tuple[Path, bool]:
             [
                 "ffmpeg", "-y", "-i", str(filepath),
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-profile:v", "high", "-level", "5.1",
+                "-profile:v", "high", "-level", "4.1",
                 "-pix_fmt", "yuv420p",
                 "-fps_mode", "cfr",
                 "-threads", FFMPEG_THREADS,
@@ -279,7 +286,7 @@ def ensure_iphone_compatible(filepath: Path) -> tuple[Path, bool]:
                 "-movflags", "+faststart",
                 str(output_path),
             ],
-            capture_output=True, text=True, timeout=300,
+            capture_output=True, text=True, timeout=TRANSCODE_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
         # Самая коварная причина "перекодировка ничего не изменила":
@@ -294,7 +301,10 @@ def ensure_iphone_compatible(filepath: Path) -> tuple[Path, bool]:
         )
         return filepath, False
     except subprocess.TimeoutExpired:
-        logger.error("Перекодировка %s превысила таймаут 300с; отправляю как есть.", filepath)
+        logger.error(
+            "Перекодировка %s превысила таймаут %sс; отправляю как есть.",
+            filepath, TRANSCODE_TIMEOUT_SECONDS,
+        )
         return filepath, False
 
     if result.returncode != 0:
@@ -375,10 +385,21 @@ def file_has_audio_stream(filepath: Path) -> bool:
         return True
 
 
-def download_video(url: str, user_id: int) -> tuple[Path, bool, bool]:
+def _find_downloaded_video(job_dir: Path) -> Path:
+    """Найти единственный итоговый видеофайл внутри каталога задания."""
+    candidates = [
+        path for path in job_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".avi"}
+    ]
+    if not candidates:
+        raise FileNotFoundError(f"yt-dlp не создал видеофайл в {job_dir}")
+    return max(candidates, key=lambda path: path.stat().st_size)
+
+
+def download_video(url: str) -> tuple[Path, bool, bool, Path]:
     """Скачать `url` через yt-dlp.
 
-    Возвращает (путь_к_файлу, has_audio, transcode_ok). has_audio
+    Возвращает (путь_к_файлу, has_audio, transcode_ok, каталог_задания). has_audio
     определяется по реальному итоговому файлу (через ffprobe), а не по
     метаданным yt-dlp, которые не всегда точно отражают результат.
     transcode_ok == False означает, что перекодировка в совместимый с
@@ -386,20 +407,22 @@ def download_video(url: str, user_id: int) -> tuple[Path, bool, bool]:
     — в таком случае проблемы с воспроизведением на iPhone ожидаемы, и
     подробности будут в логах (см. ensure_iphone_compatible).
     """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    outtmpl = str(DOWNLOAD_DIR / f"{user_id}_{timestamp}_%(title).50s.%(ext)s")
+    job_dir = DOWNLOAD_DIR / uuid.uuid4().hex
+    job_dir.mkdir()
+    outtmpl = str(job_dir / "%(title).50s.%(ext)s")
 
-    info = extract_with_fallback(url, download=True, outtmpl=outtmpl)
-
-    # prepare_filename только форматирует outtmpl по данным info — cookies
-    # для этого не нужны, поэтому подходит любой экземпляр YoutubeDL с тем
-    # же outtmpl.
-    with yt_dlp.YoutubeDL(build_ydl_opts(outtmpl, use_cookies=False)) as ydl:
-        filename = ydl.prepare_filename(info)
-
-    filepath, transcode_ok = ensure_iphone_compatible(Path(filename))
-    has_audio = file_has_audio_stream(filepath)
-    return filepath, has_audio, transcode_ok
+    try:
+        extract_with_fallback(url, download=True, outtmpl=outtmpl)
+        # Не восстанавливаем имя через prepare_filename: постобработка yt-dlp
+        # может изменить расширение при merge. В отдельном каталоге задания
+        # итоговый файл определяется однозначно по факту его создания.
+        filepath = _find_downloaded_video(job_dir)
+        filepath, transcode_ok = ensure_iphone_compatible(filepath)
+        has_audio = file_has_audio_stream(filepath)
+        return filepath, has_audio, transcode_ok, job_dir
+    except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
 
 
 
@@ -432,7 +455,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Проверка через yt-dlp тоже выполняет сетевые и CPU-затратные операции,
         # поэтому ограничиваем её тем же семафором, что и скачивание.
         async with DOWNLOAD_SEMAPHORE:
-            has_audio = await asyncio.to_thread(probe_has_audio, url)
+            has_audio, duration = await asyncio.to_thread(probe_video, url)
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось проверить ссылку %s", url)
         await status_msg.edit_text(
@@ -441,9 +464,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    if MAX_VIDEO_DURATION_SECONDS > 0 and duration and duration > MAX_VIDEO_DURATION_SECONDS:
+        await status_msg.edit_text(
+            "⚠️ Ролик слишком длинный для обработки ботом "
+            f"(больше {MAX_VIDEO_DURATION_SECONDS // 60} минут)."
+        )
+        return
+
     if has_audio:
         await status_msg.edit_text("⏳ Скачиваю видео...")
-        await run_download_and_send(status_msg, url, update.effective_user.id)
+        await run_download_and_send(status_msg, url)
         return
 
     # Звука нет — спрашиваем подтверждение через кнопки
@@ -505,7 +535,7 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     await query.edit_message_text("⏳ Скачиваю видео...")
-    await run_download_and_send(query.message, url, query.from_user.id)
+    await run_download_and_send(query.message, url)
 
 
 def _get_duration_seconds(filepath: Path) -> float | None:
@@ -547,20 +577,22 @@ def compress_to_fit(filepath: Path, target_bytes: int) -> Path:
         subprocess.run(
             [
                 "ffmpeg", "-y", "-i", str(filepath),
-                # Ограничиваем ширину 1280px (720p) — на маленьких серверах
+                # Ограничиваем обе стороны 1280px — на маленьких серверах
                 # (мало RAM) кодирование полного 1080p+ видео может вызвать
                 # OOM-убийство процесса (SIGKILL). Понижение разрешения
                 # заметно снижает потребление памяти при кодировании.
-                "-vf", "scale='min(1280,iw)':-2",
-                "-c:v", "libx264", "-preset", "veryfast",
+                "-vf", "scale=1280:1280:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                "-c:v", "libx264", "-threads", FFMPEG_THREADS, "-preset", "veryfast",
+                "-profile:v", "high", "-level", "4.1", "-pix_fmt", "yuv420p",
+                "-fps_mode", "cfr",
                 "-b:v", f"{video_bitrate_kbps}k",
                 "-maxrate", f"{video_bitrate_kbps}k",
                 "-bufsize", f"{video_bitrate_kbps * 2}k",
-                "-c:a", "aac", "-b:a", f"{audio_bitrate_kbps}k",
+                "-c:a", "aac", "-b:a", f"{audio_bitrate_kbps}k", "-ar", "44100",
                 "-movflags", "+faststart",
                 str(output_path),
             ],
-            check=True, capture_output=True, timeout=600,
+            check=True, capture_output=True, timeout=COMPRESSION_TIMEOUT_SECONDS,
         )
     except Exception:
         logger.exception("Не удалось сжать %s; отправляю оригинал.", filepath)
@@ -570,9 +602,10 @@ def compress_to_fit(filepath: Path, target_bytes: int) -> Path:
     return output_path
 
 
-async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> None:
+async def run_download_and_send(status_msg: Message, url: str) -> None:
     """Скачать видео и отправить его в чат, обновляя статусное сообщение."""
     filepath: Path | None = None
+    job_dir: Path | None = None
     try:
         if DOWNLOAD_SEMAPHORE.locked():
             await status_msg.edit_text(
@@ -581,7 +614,7 @@ async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> 
 
         async with DOWNLOAD_SEMAPHORE:
             try:
-                filepath, has_audio, transcode_ok = await asyncio.to_thread(download_video, url, user_id)
+                filepath, has_audio, transcode_ok, job_dir = await asyncio.to_thread(download_video, url)
             except Exception:  # noqa: BLE001
                 logger.exception("Не удалось скачать %s", url)
                 await status_msg.edit_text(
@@ -598,7 +631,7 @@ async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> 
                     f"🗜 Видео весит {size / 1_048_576:.1f} МБ — это больше лимита "
                     "Telegram (50 МБ). Сжимаю..."
                 )
-                for margin in (0.95, 0.80, 0.60):
+                for margin in COMPRESSION_MARGINS:
                     filepath = await asyncio.to_thread(
                         compress_to_fit, filepath, target_bytes=int(TELEGRAM_SEND_LIMIT_BYTES * margin)
                     )
@@ -651,11 +684,11 @@ async def run_download_and_send(status_msg: Message, url: str, user_id: int) -> 
                 ),
             )
     finally:
-        if filepath is not None:
+        if job_dir is not None:
             try:
-                filepath.unlink(missing_ok=True)
+                shutil.rmtree(job_dir)
             except OSError:
-                logger.exception("Не удалось удалить временный файл %s", filepath)
+                logger.exception("Не удалось удалить временный каталог %s", job_dir)
 
 
 # --------------------------------------------------------------------------- #
@@ -681,4 +714,3 @@ def main() -> None:
 if __name__ == "__main__":
     main()
     
-
