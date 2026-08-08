@@ -1,0 +1,13 @@
+.git
+.gitignore
+.gitattributes
+.idea
+.venv
+venv
+__pycache__
+*.pyc
+.env
+tocken.env
+cookies.txt
+downloads
+tests

@@ -1,6 +1,10 @@
 .env
+tocken.env
+cookies.txt
 downloads/
 __pycache__/
 venv/
+.venv/
+.idea/
 *.pyc
 www.instagram.com_cookies.txt

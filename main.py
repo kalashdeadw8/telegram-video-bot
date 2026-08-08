@@ -32,11 +32,14 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import time
 import uuid
 from dataclasses import dataclass
+from ipaddress import ip_address
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -59,13 +62,29 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 DOWNLOAD_DIR = Path(__file__).parent / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    """Прочитать целочисленную настройку и сразу дать понятную ошибку."""
+    raw_value = os.environ.get(name, str(default))
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} должен быть целым числом, получено: {raw_value!r}") from exc
+    if value < minimum:
+        raise RuntimeError(f"{name} должен быть не меньше {minimum}, получено: {value}")
+    return value
+
+
 TELEGRAM_SEND_LIMIT_BYTES = 50 * 1024 * 1024  # лимит Bot API на отправку файла
 # Не даём одной заявке часами удерживать очередь и заполнять диск. Значение 0
 # отключает ограничение; для обычных роликов получаса достаточно.
-MAX_VIDEO_DURATION_SECONDS = int(os.environ.get("MAX_VIDEO_DURATION_SECONDS", "1800"))
-TRANSCODE_TIMEOUT_SECONDS = int(os.environ.get("TRANSCODE_TIMEOUT_SECONDS", "300"))
-COMPRESSION_TIMEOUT_SECONDS = int(os.environ.get("COMPRESSION_TIMEOUT_SECONDS", "300"))
+MAX_VIDEO_DURATION_SECONDS = _env_int("MAX_VIDEO_DURATION_SECONDS", 1800, minimum=0)
+TRANSCODE_TIMEOUT_SECONDS = _env_int("TRANSCODE_TIMEOUT_SECONDS", 300)
+COMPRESSION_TIMEOUT_SECONDS = _env_int("COMPRESSION_TIMEOUT_SECONDS", 300)
 COMPRESSION_MARGINS = (0.90, 0.65)
+TEMP_DIR_TTL_SECONDS = _env_int("TEMP_DIR_TTL_SECONDS", 3600)
+USER_COOLDOWN_SECONDS = _env_int("USER_COOLDOWN_SECONDS", 15, minimum=0)
+MAX_QUEUED_JOBS = _env_int("MAX_QUEUED_JOBS", 10, minimum=0)
 
 # Без явного лимита ffmpeg сам определяет число потоков кодирования по
 # количеству ядер, которое видит в системе. На многих PaaS-хостингах
@@ -74,7 +93,7 @@ COMPRESSION_MARGINS = (0.90, 0.65)
 # ffmpeg запускает кодирование в десятки потоков, буферы кадров разрастаются
 # кратно, и процесс убивает OOM killer контейнера (subprocess получает
 # SIGKILL, код возврата -9). Поэтому жёстко ограничиваем число потоков.
-FFMPEG_THREADS = os.environ.get("FFMPEG_THREADS", "2")
+FFMPEG_THREADS = str(_env_int("FFMPEG_THREADS", 2))
 
 URL_REGEX = re.compile(r"https?://\S+")
 
@@ -109,6 +128,10 @@ _cookies_b64 = os.environ.get("COOKIES_B64")
 if _cookies_b64:
     try:
         COOKIES_FILE.write_bytes(base64.b64decode(_cookies_b64))
+        try:
+            os.chmod(COOKIES_FILE, 0o600)
+        except OSError:
+            logger.warning("Не удалось ограничить права доступа к %s", COOKIES_FILE)
         logger.info("Cookies.txt загружен из переменной окружения COOKIES_B64.")
     except Exception:
         logger.exception("Не удалось декодировать COOKIES_B64; продолжаю без cookies.")
@@ -134,8 +157,11 @@ PENDING_DOWNLOAD_TTL_SECONDS = 15 * 60  # неподтверждённые сс�
 # них может создавать тяжёлую нагрузку на CPU (ffmpeg) и диск, поэтому без
 # лимита несколько параллельных запросов от разных пользователей способны
 # положить сервер. Значение настраивается через переменную окружения.
-MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "2"))
+MAX_CONCURRENT_JOBS = _env_int("MAX_CONCURRENT_JOBS", 2)
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+# Не позволяем неограниченно накапливать ожидания в памяти при спаме ссылками.
+JOB_SLOTS = asyncio.BoundedSemaphore(MAX_CONCURRENT_JOBS + MAX_QUEUED_JOBS)
+USER_LAST_REQUEST: dict[int, float] = {}
 
 
 def _cleanup_pending_downloads() -> None:
@@ -147,6 +173,73 @@ def _cleanup_pending_downloads() -> None:
     ]
     for cid in expired:
         PENDING_DOWNLOADS.pop(cid, None)
+
+
+def _cleanup_stale_job_dirs() -> None:
+    """Удалить каталоги незавершённых заданий после перезапуска бота."""
+    cutoff = time.time() - TEMP_DIR_TTL_SECONDS
+    for path in DOWNLOAD_DIR.iterdir():
+        try:
+            if not path.is_dir() or path.stat().st_mtime >= cutoff:
+                continue
+            shutil.rmtree(path)
+            logger.info("Удалён устаревший временный каталог %s", path.name)
+        except OSError:
+            logger.exception("Не удалось удалить устаревший каталог %s", path)
+
+
+def _cleanup_user_request_times(now: float) -> None:
+    """Не позволять словарю rate limit расти бесконечно."""
+    if USER_COOLDOWN_SECONDS == 0:
+        USER_LAST_REQUEST.clear()
+        return
+    expired = [
+        user_id for user_id, requested_at in USER_LAST_REQUEST.items()
+        if now - requested_at >= USER_COOLDOWN_SECONDS
+    ]
+    for user_id in expired:
+        USER_LAST_REQUEST.pop(user_id, None)
+
+
+def _is_public_hostname(hostname: str) -> bool:
+    """Не разрешать yt-dlp обращаться к localhost и частным IP-адресам."""
+    if hostname.lower() == "localhost":
+        return False
+    try:
+        addresses = {entry[4][0] for entry in socket.getaddrinfo(hostname, None)}
+    except socket.gaierror:
+        # Не блокируем домен только из-за временного сбоя DNS: yt-dlp даст
+        # пользователю обычную ошибку, если источник действительно недоступен.
+        return True
+    for address in addresses:
+        parsed = ip_address(address)
+        if not parsed.is_global:
+            return False
+    return True
+
+
+async def validate_video_url(raw_url: str) -> str | None:
+    """Проверить URL до передачи его сетевому загрузчику."""
+    url = raw_url.rstrip(".,!?;:)]}")
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    is_public = await asyncio.to_thread(_is_public_hostname, parsed.hostname)
+    return url if is_public else None
+
+
+async def acquire_job_slot() -> bool:
+    """Занять место в ограниченной очереди, не создавая бесконечный backlog."""
+    try:
+        await asyncio.wait_for(JOB_SLOTS.acquire(), timeout=0.1)
+        return True
+    except TimeoutError:
+        return False
 
 
 def build_ydl_opts(outtmpl: str | None = None, use_cookies: bool = True) -> dict:
@@ -169,6 +262,9 @@ def build_ydl_opts(outtmpl: str | None = None, use_cookies: bool = True) -> dict
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "socket_timeout": 30,
+        "retries": 2,
+        "fragment_retries": 2,
     }
     if outtmpl:
         opts["outtmpl"] = outtmpl
@@ -445,11 +541,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Пришлите, пожалуйста, корректную ссылку на видео.")
         return
 
-    url = match.group(0)
+    url = await validate_video_url(match.group(0))
+    if url is None:
+        await update.message.reply_text("❌ Пришлите публичную ссылку на видео без логина и пароля в URL.")
+        return
+
+    user_id = update.effective_user.id
+    now = time.monotonic()
+    _cleanup_user_request_times(now)
+    previous_request = USER_LAST_REQUEST.get(user_id)
+    if previous_request is not None and now - previous_request < USER_COOLDOWN_SECONDS:
+        remaining = int(USER_COOLDOWN_SECONDS - (now - previous_request)) + 1
+        await update.message.reply_text(f"⏳ Подождите ещё {remaining} сек. перед отправкой следующей ссылки.")
+        return
+    USER_LAST_REQUEST[user_id] = now
+
     status_msg = await update.message.reply_text("🔍 Проверяю видео...")
 
-    if DOWNLOAD_SEMAPHORE.locked():
-        await status_msg.edit_text("⏳ Сервер занят, запрос поставлен в очередь на проверку...")
+    if not await acquire_job_slot():
+        await status_msg.edit_text("⏳ Очередь сервера заполнена. Попробуйте чуть позже.")
+        return
 
     try:
         # Проверка через yt-dlp тоже выполняет сетевые и CPU-затратные операции,
@@ -463,6 +574,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "или сервис временно ограничил доступ."
         )
         return
+    finally:
+        JOB_SLOTS.release()
 
     if MAX_VIDEO_DURATION_SECONDS > 0 and duration and duration > MAX_VIDEO_DURATION_SECONDS:
         await status_msg.edit_text(
@@ -606,6 +719,10 @@ async def run_download_and_send(status_msg: Message, url: str) -> None:
     """Скачать видео и отправить его в чат, обновляя статусное сообщение."""
     filepath: Path | None = None
     job_dir: Path | None = None
+    if not await acquire_job_slot():
+        await status_msg.edit_text("⏳ Очередь сервера заполнена. Попробуйте чуть позже.")
+        return
+
     try:
         if DOWNLOAD_SEMAPHORE.locked():
             await status_msg.edit_text(
@@ -640,9 +757,8 @@ async def run_download_and_send(status_msg: Message, url: str) -> None:
                         break
                 was_compressed = size <= TELEGRAM_SEND_LIMIT_BYTES
 
-        await status_msg.edit_text(f"✅ Сохранено: {filepath.name} ({size / 1_048_576:.1f} МБ)")
-
         if size <= TELEGRAM_SEND_LIMIT_BYTES:
+            await status_msg.edit_text("📤 Отправляю видео в Telegram...")
             notes = []
             if not transcode_ok:
                 notes.append(
@@ -674,6 +790,9 @@ async def run_download_and_send(status_msg: Message, url: str) -> None:
                     duration=meta["duration"],
                     supports_streaming=True,
                 )
+            await status_msg.edit_text(
+                f"✅ Отправлено: {filepath.name} ({size / 1_048_576:.1f} МБ)"
+            )
         else:
             await status_msg.get_bot().send_message(
                 chat_id=status_msg.chat_id,
@@ -689,6 +808,7 @@ async def run_download_and_send(status_msg: Message, url: str) -> None:
                 shutil.rmtree(job_dir)
             except OSError:
                 logger.exception("Не удалось удалить временный каталог %s", job_dir)
+        JOB_SLOTS.release()
 
 
 # --------------------------------------------------------------------------- #
@@ -702,6 +822,7 @@ def main() -> None:
             "Получите токен у @BotFather и задайте его перед запуском."
         )
 
+    _cleanup_stale_job_dirs()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
