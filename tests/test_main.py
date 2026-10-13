@@ -87,10 +87,11 @@ class RateLimitCleanupTests(unittest.TestCase):
 
 
 class iPhoneAudioSyncTests(unittest.TestCase):
+    @patch("main.is_already_iphone_compatible", return_value=False)
     @patch("subprocess.run")
-    def test_ensure_iphone_compatible_args_with_audio(self, mock_run):
+    def test_ensure_iphone_compatible_args_with_audio(self, mock_run, mock_compat):
         mock_run.return_value = MagicMock(returncode=0, stderr="")
-        test_file = Path("dummy.mp4")
+        test_file = Path("dummy.mkv")
 
         with patch.object(Path, "exists", return_value=True), \
              patch.object(Path, "stat", return_value=MagicMock(st_size=1000)), \
@@ -106,10 +107,11 @@ class iPhoneAudioSyncTests(unittest.TestCase):
         self.assertEqual(args[args.index("-af") + 1], "aresample=async=1000")
         self.assertIn("+faststart", args)
 
+    @patch("main.is_already_iphone_compatible", return_value=False)
     @patch("subprocess.run")
-    def test_ensure_iphone_compatible_args_without_audio(self, mock_run):
+    def test_ensure_iphone_compatible_args_without_audio(self, mock_run, mock_compat):
         mock_run.return_value = MagicMock(returncode=0, stderr="")
-        test_file = Path("dummy.mp4")
+        test_file = Path("dummy.mkv")
 
         with patch.object(Path, "exists", return_value=True), \
              patch.object(Path, "stat", return_value=MagicMock(st_size=1000)), \
@@ -140,10 +142,11 @@ class iPhoneAudioSyncTests(unittest.TestCase):
         self.assertEqual(args[args.index("-af") + 1], "aresample=async=1000")
         self.assertIn("+faststart", args)
 
+    @patch("main.is_already_iphone_compatible", return_value=False)
     @patch("subprocess.run")
-    def test_ensure_iphone_compatible_includes_scale_filter(self, mock_run):
+    def test_ensure_iphone_compatible_includes_scale_filter(self, mock_run, mock_compat):
         mock_run.return_value = MagicMock(returncode=0, stderr="")
-        test_file = Path("dummy.mp4")
+        test_file = Path("dummy.mkv")
 
         with patch.object(Path, "exists", return_value=True), \
              patch.object(Path, "stat", return_value=MagicMock(st_size=1000)), \
@@ -153,34 +156,72 @@ class iPhoneAudioSyncTests(unittest.TestCase):
 
         args = mock_run.call_args[0][0]
         self.assertIn("-vf", args)
-        self.assertEqual(args[args.index("-vf") + 1], "scale=trunc(iw/2)*2:trunc(ih/2)*2")
+        self.assertEqual(args[args.index("-vf") + 1], "scale=1280:1280:force_original_aspect_ratio=decrease:force_divisible_by=2")
+
+    @patch("main.is_already_iphone_compatible", return_value=True)
+    @patch("subprocess.run")
+    def test_ensure_iphone_compatible_skips_when_already_compatible(self, mock_run, mock_compat):
+        test_file = Path("dummy.mp4")
+        out_file, success = main.ensure_iphone_compatible(test_file, has_audio=True)
+        self.assertTrue(success)
+        self.assertEqual(out_file, test_file)
+        mock_run.assert_not_called()
 
     @patch("subprocess.run")
     def test_is_already_iphone_compatible(self, mock_run):
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout='{"streams": [{"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p"}, {"codec_type": "audio", "codec_name": "aac"}]}',
+            stdout='{"streams": [{"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p", "width": 1920, "height": 1080}, {"codec_type": "audio", "codec_name": "aac"}]}',
         )
         self.assertTrue(main.is_already_iphone_compatible(Path("video.mp4")))
 
+    def test_is_already_iphone_compatible_rejects_non_mp4(self):
+        self.assertFalse(main.is_already_iphone_compatible(Path("video.mkv")))
+
     @patch("subprocess.run")
-    def test_fallback_when_ffmpeg_fails_but_file_is_compatible(self, mock_run):
-        # Первый вызов probe stream diagnostics, второй вызов ffmpeg (ошибка), третий вызов ffprobe check
-        mock_run.side_effect = [
-            MagicMock(returncode=0, stdout="{}"), # stream diagnostics
-            MagicMock(returncode=1, stderr="transcode failed"), # ffmpeg fail
-            MagicMock(
-                returncode=0,
-                stdout='{"streams": [{"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p"}, {"codec_type": "audio", "codec_name": "aac"}]}',
-            ), # ffprobe is_already_iphone_compatible
-        ]
+    def test_is_already_iphone_compatible_rejects_odd_dimensions(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='{"streams": [{"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p", "width": 719, "height": 1280}]}',
+        )
+        self.assertFalse(main.is_already_iphone_compatible(Path("video.mp4")))
+
+    @patch("main.is_already_iphone_compatible", side_effect=[False, True])
+    @patch("subprocess.run")
+    def test_fallback_when_ffmpeg_fails_but_file_is_compatible(self, mock_run, mock_compat):
+        mock_run.return_value = MagicMock(returncode=1, stderr="transcode failed")
         test_file = Path("dummy.mp4")
-        with patch.object(Path, "exists", return_value=True), \
-             patch.object(Path, "stat", return_value=MagicMock(st_size=1000)), \
+        with patch.object(Path, "exists", return_value=False), \
              patch.object(Path, "unlink"):
             out_file, success = main.ensure_iphone_compatible(test_file, has_audio=True)
             self.assertTrue(success)
             self.assertEqual(out_file, test_file)
+
+
+class AudioTaskTests(unittest.TestCase):
+    def setUp(self):
+        main.AUDIO_TASKS.clear()
+
+    def test_cleanup_audio_tasks(self):
+        now = time.monotonic()
+        old_id = "old_task"
+        fresh_id = "fresh_task"
+        main.AUDIO_TASKS[old_id] = main.AudioTask(
+            url="https://example.com/1",
+            user_id=1,
+            chat_id=1,
+            created_at=now - main.AUDIO_TASK_TTL_SECONDS - 100,
+        )
+        main.AUDIO_TASKS[fresh_id] = main.AudioTask(
+            url="https://example.com/2",
+            user_id=1,
+            chat_id=1,
+            created_at=now,
+        )
+
+        main._cleanup_audio_tasks()
+        self.assertNotIn(old_id, main.AUDIO_TASKS)
+        self.assertIn(fresh_id, main.AUDIO_TASKS)
 
 
 if __name__ == "__main__":

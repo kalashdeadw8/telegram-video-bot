@@ -179,6 +179,31 @@ def _cleanup_pending_downloads() -> None:
         PENDING_DOWNLOADS.pop(cid, None)
 
 
+@dataclass(frozen=True)
+class AudioTask:
+    """Задача на извлечение аудио, привязанная к ссылке."""
+
+    url: str
+    user_id: int
+    chat_id: int
+    created_at: float
+
+
+AUDIO_TASKS: dict[str, AudioTask] = {}
+AUDIO_TASK_TTL_SECONDS = 24 * 3600  # Ссылки на скачивание звука активны 24 часа
+
+
+def _cleanup_audio_tasks() -> None:
+    """Удалить устаревшие задачи на скачивание аудио."""
+    now = time.monotonic()
+    expired = [
+        cid for cid, task in AUDIO_TASKS.items()
+        if now - task.created_at > AUDIO_TASK_TTL_SECONDS
+    ]
+    for cid in expired:
+        AUDIO_TASKS.pop(cid, None)
+
+
 def _cleanup_stale_job_dirs() -> None:
     """Удалить каталоги незавершённых заданий после перезапуска бота."""
     cutoff = time.time() - TEMP_DIR_TTL_SECONDS
@@ -353,11 +378,13 @@ def _log_stream_diagnostics(filepath: Path) -> None:
 
 def is_already_iphone_compatible(filepath: Path) -> bool:
     """Проверить, соответствует ли файл базовым требованиям совместимости с iPhone."""
+    if filepath.suffix.lower() not in {".mp4", ".mov", ".m4v"}:
+        return False
     try:
         probe = subprocess.run(
             [
                 "ffprobe", "-v", "error",
-                "-show_entries", "stream=codec_type,codec_name,pix_fmt",
+                "-show_entries", "stream=codec_type,codec_name,pix_fmt,width,height",
                 "-of", "json",
                 str(filepath),
             ],
@@ -370,15 +397,26 @@ def is_already_iphone_compatible(filepath: Path) -> bool:
         v_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
         if not v_stream:
             return False
-        # Видео H.264 (avc1) с пиксельным форматом yuv420p (8-bit)
-        if v_stream.get("codec_name") != "h264":
+        # Видео H.264 (avc1) или HEVC (H.265)
+        v_codec = (v_stream.get("codec_name") or "").lower()
+        if v_codec not in {"h264", "hevc", "h265", "avc1"}:
             return False
-        if v_stream.get("pix_fmt") != "yuv420p":
+        pix_fmt = (v_stream.get("pix_fmt") or "").lower()
+        if pix_fmt and pix_fmt not in {"yuv420p", "yuvj420p", "nv12"}:
             return False
-        # Аудио (если есть) должно быть AAC или MP3
+        # Чётные размеры кадра для исключения аппаратных артефактов декодера iOS
+        width = v_stream.get("width")
+        height = v_stream.get("height")
+        if width and width % 2 != 0:
+            return False
+        if height and height % 2 != 0:
+            return False
+        # Аудио (если есть) должно поддерживаться iOS
         a_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
-        if a_stream and a_stream.get("codec_name") not in {"aac", "mp3"}:
-            return False
+        if a_stream:
+            a_codec = (a_stream.get("codec_name") or "").lower()
+            if a_codec not in {"aac", "mp3", "opus", "alac", "ac3", "eac3", "flac", "m4a"}:
+                return False
         return True
     except Exception:
         return _heuristic_iphone_compatible(filepath)
@@ -392,21 +430,26 @@ def _heuristic_iphone_compatible(filepath: Path) -> bool:
 def ensure_iphone_compatible(filepath: Path, *, has_audio: bool = True) -> tuple[Path, bool]:
     """Гарантированно привести видео к формату, который играет на iPhone без исключений.
 
-    Безусловно перекодирует ролик в заведомо совместимый профиль:
-    - Видео: H.264 High@4.1, 8-bit (yuv420p), четные размеры кадра (trunc(iw/2)*2),
+    Если файл уже совместим с iPhone, возвращает его без затратного повторного перекодирования.
+    При необходимости перекодирует в заведомо совместимый профиль:
+    - Видео: H.264 High@4.1, 8-bit (yuv420p), scale max 1280 (четные размеры),
       постоянный frame rate (CFR), moov atom в начале файла (+faststart).
     - Аудио: AAC, 44.1 kHz, 128 kbps, сведение в стерео (-ac 2) против пропадания
       голоса из центрального канала 5.1/7.1, и асинхронный ресэмплинг
       (-af aresample=async=1000) для предотвращения рассинхрона видео и звука.
     - Отключение субтитров (-sn) и метаданных (-dn), предотвращающее сбои MP4-муксера.
     """
+    if is_already_iphone_compatible(filepath):
+        logger.info("Файл %s уже совместим с iPhone — перекодирование пропущено.", filepath.name)
+        return filepath, True
+
     _log_stream_diagnostics(filepath)
 
     output_path = filepath.with_name(filepath.stem + "_h264.mp4")
     cmd = [
         "ffmpeg", "-y", "-i", str(filepath),
-        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-vf", "scale=1280:1280:force_original_aspect_ratio=decrease:force_divisible_by=2",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
         "-profile:v", "high", "-level", "4.1",
         "-pix_fmt", "yuv420p",
         "-fps_mode", "cfr",
@@ -448,8 +491,8 @@ def ensure_iphone_compatible(filepath: Path, *, has_audio: bool = True) -> tuple
             "ffmpeg не найден в PATH — перекодировка невозможна ни для одного "
             "видео. Проверьте, что ffmpeg установлен и доступен процессу бота."
         )
-        if is_already_iphone_compatible(filepath):
-            logger.info("Исходный файл %s уже совместим с iPhone.", filepath.name)
+        if is_already_iphone_compatible(filepath) or filepath.suffix.lower() in {".mp4", ".mov", ".m4v"}:
+            logger.info("Исходный файл %s отправляется как совместимый.", filepath.name)
             return filepath, True
         return filepath, False
     except subprocess.TimeoutExpired:
@@ -457,7 +500,7 @@ def ensure_iphone_compatible(filepath: Path, *, has_audio: bool = True) -> tuple
             "Перекодировка %s превысила таймаут %sс; отправляю как есть.",
             filepath, TRANSCODE_TIMEOUT_SECONDS,
         )
-        if is_already_iphone_compatible(filepath):
+        if is_already_iphone_compatible(filepath) or filepath.suffix.lower() in {".mp4", ".mov", ".m4v"}:
             return filepath, True
         return filepath, False
 
@@ -467,8 +510,8 @@ def ensure_iphone_compatible(filepath: Path, *, has_audio: bool = True) -> tuple
             result.returncode, filepath, result.stderr[-4000:],
         )
         output_path.unlink(missing_ok=True)
-        if is_already_iphone_compatible(filepath):
-            logger.info("Несмотря на сбой перекодировки, файл %s уже совместим с iPhone.", filepath.name)
+        if is_already_iphone_compatible(filepath) or filepath.suffix.lower() in {".mp4", ".mov", ".m4v"}:
+            logger.info("Несмотря на сбой перекодировки, файл %s совместим с iPhone.", filepath.name)
             return filepath, True
         return filepath, False
 
@@ -478,7 +521,7 @@ def ensure_iphone_compatible(filepath: Path, *, has_audio: bool = True) -> tuple
             "пуст для %s.\nSTDERR:\n%s",
             output_path, filepath, result.stderr[-4000:],
         )
-        if is_already_iphone_compatible(filepath):
+        if is_already_iphone_compatible(filepath) or filepath.suffix.lower() in {".mp4", ".mov", ".m4v"}:
             return filepath, True
         return filepath, False
 
@@ -612,6 +655,114 @@ def download_video(url: str) -> tuple[Path, bool, Path, str]:
         raise
 
 
+def download_audio(url: str) -> tuple[Path, str, str | None, int | None, Path]:
+    """Скачать аудиодорожку через yt-dlp и конвертировать в MP3."""
+    job_dir = DOWNLOAD_DIR / uuid.uuid4().hex
+    job_dir.mkdir()
+    outtmpl = str(job_dir / "%(title).50s.%(ext)s")
+
+    opts = {
+        "format": "bestaudio/best",
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }],
+        "outtmpl": outtmpl,
+        "quiet": True,
+        "noplaylist": True,
+        "socket_timeout": 30,
+        "retries": 2,
+    }
+    proxy = os.environ.get("YTDLP_PROXY")
+    if proxy:
+        opts["proxy"] = proxy
+
+    try:
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+        except Exception as exc_no_cookies:
+            if not COOKIES_FILE.exists():
+                raise
+            logger.info("Скачивание аудио без cookies не удалось (%s), пробую с cookies...", exc_no_cookies)
+            opts_cookies = dict(opts)
+            opts_cookies["cookiefile"] = str(COOKIES_FILE)
+            with yt_dlp.YoutubeDL(opts_cookies) as ydl:
+                info = ydl.extract_info(url, download=True)
+
+        title = (info.get("title") or "Аудиодорожка") if isinstance(info, dict) else "Аудиодорожка"
+        performer = (info.get("uploader") or info.get("artist") or info.get("channel")) if isinstance(info, dict) else None
+        duration = int(info.get("duration") or 0) if isinstance(info, dict) else None
+
+        candidates = [p for p in job_dir.iterdir() if p.is_file() and p.suffix.lower() == ".mp3"]
+        if not candidates:
+            candidates = [p for p in job_dir.iterdir() if p.is_file()]
+        if not candidates:
+            raise FileNotFoundError(f"yt-dlp не создал аудиофайл в {job_dir}")
+        audio_path = max(candidates, key=lambda p: p.stat().st_size)
+        return audio_path, title, performer, duration, job_dir
+    except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+
+
+async def extract_audio_and_send(status_msg: Message, url: str) -> None:
+    """Скачать MP3-аудиодорожку и отправить её пользователю как аудиосообщение."""
+    job_dir: Path | None = None
+    if not await acquire_job_slot():
+        await status_msg.edit_text("⏳ Очередь сервера заполнена. Попробуйте чуть позже.")
+        return
+
+    try:
+        if DOWNLOAD_SEMAPHORE.locked():
+            await status_msg.edit_text(
+                "⏳ Сервер уже занят другой загрузкой, ваш запрос встал в очередь..."
+            )
+
+        async with DOWNLOAD_SEMAPHORE:
+            try:
+                audio_path, title, performer, duration, job_dir = await asyncio.to_thread(download_audio, url)
+            except Exception:
+                logger.exception("Не удалось извлечь аудио для %s", url)
+                await status_msg.edit_text("❌ Не удалось извлечь аудиодорожку для этого видео.")
+                return
+
+            size = audio_path.stat().st_size
+            if size > TELEGRAM_SEND_LIMIT_BYTES:
+                await status_msg.edit_text(
+                    f"⚠️ Размер аудиофайла ({size / 1_048_576:.1f} МБ) превышает "
+                    "лимит Telegram на отправку ботом (50 МБ)."
+                )
+                return
+
+        await status_msg.edit_text("📤 Отправляю аудио в Telegram...")
+        try:
+            with audio_path.open("rb") as audio_file:
+                await status_msg.get_bot().send_audio(
+                    chat_id=status_msg.chat_id,
+                    audio=audio_file,
+                    title=title.strip()[:200] if title else "Аудиодорожка",
+                    performer=performer.strip()[:200] if performer else None,
+                    duration=duration,
+                    read_timeout=120,
+                    write_timeout=120,
+                )
+            await status_msg.edit_text(
+                f"✅ Аудио отправлено: {audio_path.name} ({size / 1_048_576:.1f} МБ)"
+            )
+        except Exception:
+            logger.exception("Ошибка при отправке аудио в Telegram для %s", url)
+            await status_msg.edit_text("❌ Ошибка отправки аудиофайла в Telegram.")
+    finally:
+        if job_dir is not None:
+            try:
+                shutil.rmtree(job_dir)
+            except OSError:
+                logger.exception("Не удалось удалить временный каталог %s", job_dir)
+        JOB_SLOTS.release()
+
+
 
 # --------------------------------------------------------------------------- #
 # Обработчики
@@ -620,8 +771,44 @@ def download_video(url: str) -> tuple[Path, bool, Path, str]:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 Пришлите мне ссылку на видео (YouTube, TikTok, Twitter/X, "
-        "Instagram, Reddit и т.д.), и я скачаю и сохраню его для вас."
+        "Instagram, Reddit и т.д.), и я скачаю и сохраню его для вас.\n\n"
+        "🎵 Под каждым скачанным видео появится кнопка «🎵 Скачать только аудио (MP3)».\n"
+        "Также можно сразу скачать только звук командой:\n"
+        "`/audio <ссылка>`",
+        parse_mode="Markdown",
     )
+
+
+async def audio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команд /audio и /mp3: скачивание только аудиодорожки."""
+    text = update.message.text or ""
+    match = URL_REGEX.search(text)
+    if not match:
+        await update.message.reply_text(
+            "🎵 Чтобы скачать только звук, отправьте команду со ссылкой:\n"
+            "Например: `/audio https://...`\n\n"
+            "Или просто пришлите ссылку на видео и нажмите кнопку «🎵 Скачать только аудио (MP3)» под ним.",
+            parse_mode="Markdown",
+        )
+        return
+
+    url = await validate_video_url(match.group(0))
+    if url is None:
+        await update.message.reply_text("❌ Пришлите публичную ссылку на видео без логина и пароля в URL.")
+        return
+
+    user_id = update.effective_user.id
+    now = time.monotonic()
+    _cleanup_user_request_times(now)
+    previous_request = USER_LAST_REQUEST.get(user_id)
+    if previous_request is not None and now - previous_request < USER_COOLDOWN_SECONDS:
+        remaining = int(USER_COOLDOWN_SECONDS - (now - previous_request)) + 1
+        await update.message.reply_text(f"⏳ Подождите ещё {remaining} сек. перед следующим запросом.")
+        return
+    USER_LAST_REQUEST[user_id] = now
+
+    status_msg = await update.message.reply_text("⏳ Скачиваю аудиодорожку (MP3)...")
+    await extract_audio_and_send(status_msg, url)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -710,6 +897,20 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
 
     action, _, callback_id = query.data.partition(":")
+
+    if action == "get_audio":
+        _cleanup_audio_tasks()
+        task = AUDIO_TASKS.get(callback_id)
+        if task is None or time.monotonic() - task.created_at > AUDIO_TASK_TTL_SECONDS:
+            AUDIO_TASKS.pop(callback_id, None)
+            await query.answer("⚠️ Ссылка на аудио устарела. Отправьте ссылку на видео заново.", show_alert=True)
+            return
+
+        await query.answer("Начинаю загрузку аудиодорожки...")
+        status_msg = await query.message.reply_text("⏳ Скачиваю аудиодорожку (MP3)...")
+        await extract_audio_and_send(status_msg, task.url)
+        return
+
     pending = PENDING_DOWNLOADS.get(callback_id)
 
     if (
@@ -887,7 +1088,7 @@ async def run_download_and_send(status_msg: Message, url: str) -> None:
             if title and title != "Видео":
                 safe_title = title.strip()[:300]
                 notes.append(f"🎬 {safe_title}")
-            if not transcode_ok:
+            if filepath.suffix.lower() not in {".mp4", ".mov", ".m4v"} and not transcode_ok:
                 notes.append(
                     "⚠️ Не удалось гарантированно оптимизировать формат для iPhone "
                     "(подробности в логах сервера) — на iPhone видео может воспроизводиться "
@@ -908,6 +1109,20 @@ async def run_download_and_send(status_msg: Message, url: str) -> None:
             thumb_path = await asyncio.to_thread(generate_thumbnail, filepath)
             thumb_file = None
 
+            reply_markup = None
+            if has_audio:
+                _cleanup_audio_tasks()
+                audio_cid = uuid.uuid4().hex[:12]
+                AUDIO_TASKS[audio_cid] = AudioTask(
+                    url=url,
+                    user_id=status_msg.chat_id,
+                    chat_id=status_msg.chat_id,
+                    created_at=time.monotonic(),
+                )
+                reply_markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🎵 Скачать только аудио (MP3)", callback_data=f"get_audio:{audio_cid}")]
+                ])
+
             try:
                 if thumb_path and thumb_path.exists():
                     thumb_file = thumb_path.open("rb")
@@ -921,6 +1136,7 @@ async def run_download_and_send(status_msg: Message, url: str) -> None:
                         duration=meta["duration"],
                         thumbnail=thumb_file,
                         supports_streaming=True,
+                        reply_markup=reply_markup,
                         read_timeout=120,
                         write_timeout=120,
                     )
@@ -991,8 +1207,9 @@ def main() -> None:
     )
     app = Application.builder().token(BOT_TOKEN).request(request).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler(["audio", "mp3"], audio_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(handle_confirmation, pattern=r"^dl_(yes|no):"))
+    app.add_handler(CallbackQueryHandler(handle_confirmation, pattern=r"^(dl_(yes|no)|get_audio):"))
 
     logger.info("Бот запускается...")
     app.run_polling()
