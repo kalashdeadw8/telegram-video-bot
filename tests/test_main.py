@@ -140,6 +140,48 @@ class iPhoneAudioSyncTests(unittest.TestCase):
         self.assertEqual(args[args.index("-af") + 1], "aresample=async=1000")
         self.assertIn("+faststart", args)
 
+    @patch("subprocess.run")
+    def test_ensure_iphone_compatible_includes_scale_filter(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+        test_file = Path("dummy.mp4")
+
+        with patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "stat", return_value=MagicMock(st_size=1000)), \
+             patch.object(Path, "unlink"):
+            out_file, success = main.ensure_iphone_compatible(test_file, has_audio=True)
+            self.assertTrue(success)
+
+        args = mock_run.call_args[0][0]
+        self.assertIn("-vf", args)
+        self.assertEqual(args[args.index("-vf") + 1], "scale=trunc(iw/2)*2:trunc(ih/2)*2")
+
+    @patch("subprocess.run")
+    def test_is_already_iphone_compatible(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='{"streams": [{"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p"}, {"codec_type": "audio", "codec_name": "aac"}]}',
+        )
+        self.assertTrue(main.is_already_iphone_compatible(Path("video.mp4")))
+
+    @patch("subprocess.run")
+    def test_fallback_when_ffmpeg_fails_but_file_is_compatible(self, mock_run):
+        # Первый вызов probe stream diagnostics, второй вызов ffmpeg (ошибка), третий вызов ffprobe check
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="{}"), # stream diagnostics
+            MagicMock(returncode=1, stderr="transcode failed"), # ffmpeg fail
+            MagicMock(
+                returncode=0,
+                stdout='{"streams": [{"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p"}, {"codec_type": "audio", "codec_name": "aac"}]}',
+            ), # ffprobe is_already_iphone_compatible
+        ]
+        test_file = Path("dummy.mp4")
+        with patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "stat", return_value=MagicMock(st_size=1000)), \
+             patch.object(Path, "unlink"):
+            out_file, success = main.ensure_iphone_compatible(test_file, has_audio=True)
+            self.assertTrue(success)
+            self.assertEqual(out_file, test_file)
+
 
 if __name__ == "__main__":
     unittest.main()

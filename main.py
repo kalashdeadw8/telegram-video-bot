@@ -351,27 +351,67 @@ def _log_stream_diagnostics(filepath: Path) -> None:
         logger.exception("Не удалось получить диагностику потоков для %s", filepath)
 
 
+def is_already_iphone_compatible(filepath: Path) -> bool:
+    """Проверить, соответствует ли файл базовым требованиям совместимости с iPhone."""
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "stream=codec_type,codec_name,pix_fmt",
+                "-of", "json",
+                str(filepath),
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+        if probe.returncode != 0:
+            return _heuristic_iphone_compatible(filepath)
+        data = json.loads(probe.stdout)
+        streams = data.get("streams", [])
+        v_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+        if not v_stream:
+            return False
+        # Видео H.264 (avc1) с пиксельным форматом yuv420p (8-bit)
+        if v_stream.get("codec_name") != "h264":
+            return False
+        if v_stream.get("pix_fmt") != "yuv420p":
+            return False
+        # Аудио (если есть) должно быть AAC или MP3
+        a_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+        if a_stream and a_stream.get("codec_name") not in {"aac", "mp3"}:
+            return False
+        return True
+    except Exception:
+        return _heuristic_iphone_compatible(filepath)
+
+
+def _heuristic_iphone_compatible(filepath: Path) -> bool:
+    """Если ffprobe недоступен, эвристически проверяем расширение контейнера."""
+    return filepath.suffix.lower() in {".mp4", ".mov", ".m4v"}
+
+
 def ensure_iphone_compatible(filepath: Path, *, has_audio: bool = True) -> tuple[Path, bool]:
     """Гарантированно привести видео к формату, который играет на iPhone без исключений.
 
     Безусловно перекодирует ролик в заведомо совместимый профиль:
-    - Видео: H.264 High@4.1, 8-bit (yuv420p), постоянный frame rate (CFR), moov atom
-      в начале файла (+faststart).
+    - Видео: H.264 High@4.1, 8-bit (yuv420p), четные размеры кадра (trunc(iw/2)*2),
+      постоянный frame rate (CFR), moov atom в начале файла (+faststart).
     - Аудио: AAC, 44.1 kHz, 128 kbps, сведение в стерео (-ac 2) против пропадания
       голоса из центрального канала 5.1/7.1, и асинхронный ресэмплинг
       (-af aresample=async=1000) для предотвращения рассинхрона видео и звука.
-    - Если у видео нет звука, флаг -an гарантирует отсутствие битых аудио-заголовков.
+    - Отключение субтитров (-sn) и метаданных (-dn), предотвращающее сбои MP4-муксера.
     """
     _log_stream_diagnostics(filepath)
 
     output_path = filepath.with_name(filepath.stem + "_h264.mp4")
     cmd = [
         "ffmpeg", "-y", "-i", str(filepath),
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         "-profile:v", "high", "-level", "4.1",
         "-pix_fmt", "yuv420p",
         "-fps_mode", "cfr",
         "-threads", FFMPEG_THREADS,
+        "-sn", "-dn",
     ]
     if has_audio:
         cmd.extend([
@@ -394,18 +434,31 @@ def ensure_iphone_compatible(filepath: Path, *, has_audio: bool = True) -> tuple
             cmd,
             capture_output=True, text=True, timeout=TRANSCODE_TIMEOUT_SECONDS,
         )
+        if result.returncode != 0 and "fps_mode" in result.stderr:
+            cmd_fallback = [
+                arg if arg != "-fps_mode" else "-vsync"
+                for arg in cmd
+            ]
+            result = subprocess.run(
+                cmd_fallback,
+                capture_output=True, text=True, timeout=TRANSCODE_TIMEOUT_SECONDS,
+            )
     except FileNotFoundError:
         logger.error(
             "ffmpeg не найден в PATH — перекодировка невозможна ни для одного "
-            "видео. Проверьте, что ffmpeg установлен и доступен процессу бота "
-            "(попробуйте `which ffmpeg` из-под того же пользователя/окружения)."
+            "видео. Проверьте, что ffmpeg установлен и доступен процессу бота."
         )
+        if is_already_iphone_compatible(filepath):
+            logger.info("Исходный файл %s уже совместим с iPhone.", filepath.name)
+            return filepath, True
         return filepath, False
     except subprocess.TimeoutExpired:
         logger.error(
             "Перекодировка %s превысила таймаут %sс; отправляю как есть.",
             filepath, TRANSCODE_TIMEOUT_SECONDS,
         )
+        if is_already_iphone_compatible(filepath):
+            return filepath, True
         return filepath, False
 
     if result.returncode != 0:
@@ -414,6 +467,9 @@ def ensure_iphone_compatible(filepath: Path, *, has_audio: bool = True) -> tuple
             result.returncode, filepath, result.stderr[-4000:],
         )
         output_path.unlink(missing_ok=True)
+        if is_already_iphone_compatible(filepath):
+            logger.info("Несмотря на сбой перекодировки, файл %s уже совместим с iPhone.", filepath.name)
+            return filepath, True
         return filepath, False
 
     if not output_path.exists() or output_path.stat().st_size == 0:
@@ -422,6 +478,8 @@ def ensure_iphone_compatible(filepath: Path, *, has_audio: bool = True) -> tuple
             "пуст для %s.\nSTDERR:\n%s",
             output_path, filepath, result.stderr[-4000:],
         )
+        if is_already_iphone_compatible(filepath):
+            return filepath, True
         return filepath, False
 
     filepath.unlink(missing_ok=True)
@@ -727,6 +785,7 @@ def compress_to_fit(filepath: Path, target_bytes: int, *, has_audio: bool = True
         "-b:v", f"{video_bitrate_kbps}k",
         "-maxrate", f"{video_bitrate_kbps}k",
         "-bufsize", f"{video_bitrate_kbps * 2}k",
+        "-sn", "-dn",
     ]
     if has_audio:
         cmd.extend([
@@ -745,10 +804,22 @@ def compress_to_fit(filepath: Path, target_bytes: int, *, has_audio: bool = True
     ])
 
     try:
-        subprocess.run(
+        result = subprocess.run(
             cmd,
-            check=True, capture_output=True, timeout=COMPRESSION_TIMEOUT_SECONDS,
+            capture_output=True, text=True, timeout=COMPRESSION_TIMEOUT_SECONDS,
         )
+        if result.returncode != 0 and "fps_mode" in result.stderr:
+            cmd_fallback = [
+                arg if arg != "-fps_mode" else "-vsync"
+                for arg in cmd
+            ]
+            result = subprocess.run(
+                cmd_fallback,
+                capture_output=True, text=True, timeout=COMPRESSION_TIMEOUT_SECONDS,
+            )
+        if result.returncode != 0:
+            logger.error("Ошибка сжатия %s: %s", filepath, result.stderr[-2000:])
+            return filepath, False
     except Exception:
         logger.exception("Не удалось сжать %s; отправляю оригинал.", filepath)
         return filepath, False
@@ -887,12 +958,29 @@ async def run_download_and_send(status_msg: Message, url: str) -> None:
 # Точка входа
 # --------------------------------------------------------------------------- #
 
+def check_ffmpeg_installed() -> bool:
+    try:
+        res = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit(
             "Отсутствует переменная окружения TELEGRAM_BOT_TOKEN. "
             "Получите токен у @BotFather и задайте его перед запуском."
         )
+
+    if not check_ffmpeg_installed():
+        logger.warning(
+            "⚠️ ВНИМАНИЕ: ffmpeg не найден в PATH! Видеофайлы будут отправляться "
+            "в исходном виде или с базовой проверкой совместимости. Убедитесь, что "
+            "ffmpeg установлен в окружении или контейнере."
+        )
+    else:
+        logger.info("ffmpeg обнаружен в PATH и готов к работе.")
 
     _cleanup_stale_job_dirs()
     request = HTTPXRequest(
