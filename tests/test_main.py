@@ -87,7 +87,7 @@ class RateLimitCleanupTests(unittest.TestCase):
 
 
 class iPhoneAudioSyncTests(unittest.TestCase):
-    @patch("main.is_already_iphone_compatible", return_value=False)
+    @patch("main.is_already_iphone_compatible", return_value=None)
     @patch("subprocess.run")
     def test_ensure_iphone_compatible_args_with_audio(self, mock_run, mock_compat):
         mock_run.return_value = MagicMock(returncode=0, stderr="")
@@ -107,7 +107,7 @@ class iPhoneAudioSyncTests(unittest.TestCase):
         self.assertEqual(args[args.index("-af") + 1], "aresample=async=1000")
         self.assertIn("+faststart", args)
 
-    @patch("main.is_already_iphone_compatible", return_value=False)
+    @patch("main.is_already_iphone_compatible", return_value=None)
     @patch("subprocess.run")
     def test_ensure_iphone_compatible_args_without_audio(self, mock_run, mock_compat):
         mock_run.return_value = MagicMock(returncode=0, stderr="")
@@ -123,9 +123,10 @@ class iPhoneAudioSyncTests(unittest.TestCase):
         self.assertIn("-an", args)
         self.assertNotIn("-af", args)
 
+    @patch("main.is_already_iphone_compatible", return_value=True)
     @patch("subprocess.run")
     @patch("main._get_duration_seconds", return_value=60.0)
-    def test_compress_to_fit_args_with_audio(self, mock_dur, mock_run):
+    def test_compress_to_fit_args_with_audio(self, mock_dur, mock_run, mock_compat):
         mock_run.return_value = MagicMock(returncode=0)
         test_file = Path("dummy.mp4")
 
@@ -142,7 +143,7 @@ class iPhoneAudioSyncTests(unittest.TestCase):
         self.assertEqual(args[args.index("-af") + 1], "aresample=async=1000")
         self.assertIn("+faststart", args)
 
-    @patch("main.is_already_iphone_compatible", return_value=False)
+    @patch("main.is_already_iphone_compatible", return_value=None)
     @patch("subprocess.run")
     def test_ensure_iphone_compatible_includes_scale_filter(self, mock_run, mock_compat):
         mock_run.return_value = MagicMock(returncode=0, stderr="")
@@ -156,46 +157,101 @@ class iPhoneAudioSyncTests(unittest.TestCase):
 
         args = mock_run.call_args[0][0]
         self.assertIn("-vf", args)
-        self.assertEqual(args[args.index("-vf") + 1], "scale=1280:1280:force_original_aspect_ratio=decrease:force_divisible_by=2")
+        self.assertTrue(args[args.index("-vf") + 1].startswith(
+            "scale=1280:1280:force_original_aspect_ratio=decrease:force_divisible_by=2"))
+        # Явно выбираем основной видеопоток (не обложку) и тег avc1 для «Фото» на iOS
+        self.assertEqual(args[args.index("-map") + 1], "0:V:0")
+        self.assertEqual(args[args.index("-tag:v") + 1], "avc1")
 
     @patch("main.is_already_iphone_compatible", return_value=True)
     @patch("subprocess.run")
-    def test_ensure_iphone_compatible_skips_when_already_compatible(self, mock_run, mock_compat):
+    def test_ensure_iphone_compatible_always_transcodes(self, mock_run, mock_compat):
+        """Даже «совместимый на вид» файл перекодируется — никаких пропусков по эвристике."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
         test_file = Path("dummy.mp4")
-        out_file, success = main.ensure_iphone_compatible(test_file, has_audio=True)
+        with patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "stat", return_value=MagicMock(st_size=1000)), \
+             patch.object(Path, "unlink"):
+            out_file, success = main.ensure_iphone_compatible(test_file, has_audio=True)
         self.assertTrue(success)
-        self.assertEqual(out_file, test_file)
-        mock_run.assert_not_called()
+        self.assertNotEqual(out_file, test_file)
+        self.assertTrue(any(call[0][0][0] == "ffmpeg" for call in mock_run.call_args_list))
+
+    @patch("main.is_already_iphone_compatible", return_value=None)
+    @patch("subprocess.run")
+    def test_ensure_iphone_compatible_retries_with_lighter_settings(self, mock_run, mock_compat):
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "ffmpeg" and "veryfast" in cmd:
+                return MagicMock(returncode=-9, stderr="Killed")
+            return MagicMock(returncode=0, stderr="", stdout="{}")
+        mock_run.side_effect = fake_run
+        with patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "stat", return_value=MagicMock(st_size=1000)), \
+             patch.object(Path, "unlink"):
+            out_file, success = main.ensure_iphone_compatible(Path("dummy.mkv"), has_audio=True)
+        self.assertTrue(success)
+        presets = [c[0][0][c[0][0].index("-preset") + 1] for c in mock_run.call_args_list if c[0][0][0] == "ffmpeg"]
+        self.assertEqual(presets, ["veryfast", "ultrafast"])
 
     @patch("subprocess.run")
     def test_is_already_iphone_compatible(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=0,
-            stdout='{"streams": [{"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p", "width": 1920, "height": 1080}, {"codec_type": "audio", "codec_name": "aac"}]}',
-        )
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"streams": [{"codec_type": "video", "codec_name": "h264", "codec_tag_string": "avc1", "profile": "High", "pix_fmt": "yuv420p", "width": 1920, "height": 1080}, {"codec_type": "audio", "codec_name": "aac"}]}')
         self.assertTrue(main.is_already_iphone_compatible(Path("video.mp4")))
 
     def test_is_already_iphone_compatible_rejects_non_mp4(self):
         self.assertFalse(main.is_already_iphone_compatible(Path("video.mkv")))
 
     @patch("subprocess.run")
-    def test_is_already_iphone_compatible_rejects_odd_dimensions(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=0,
-            stdout='{"streams": [{"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p", "width": 719, "height": 1280}]}',
-        )
+    def test_rejects_hevc_hev1_and_opus(self, mock_run):
+        """Регрессия: HEVC(hev1)+Opus (TikTok) не сохраняется в «Фото», в «Файлах» нет видеоряда."""
+        mock_run.return_value = MagicMock(returncode=0, stdout=(
+            '{"streams": [{"codec_type": "video", "codec_name": "hevc", "codec_tag_string": "hev1", '
+            '"profile": "Main", "pix_fmt": "yuv420p", "width": 720, "height": 1280}, '
+            '{"codec_type": "audio", "codec_name": "opus"}]}'))
         self.assertFalse(main.is_already_iphone_compatible(Path("video.mp4")))
 
-    @patch("main.is_already_iphone_compatible", side_effect=[False, True])
     @patch("subprocess.run")
-    def test_fallback_when_ffmpeg_fails_but_file_is_compatible(self, mock_run, mock_compat):
+    def test_rejects_opus_audio_with_h264(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout=(
+            '{"streams": [{"codec_type": "video", "codec_name": "h264", "codec_tag_string": "avc1", "profile": "High", "pix_fmt": "yuv420p", "width": 1920, "height": 1080}, {"codec_type": "audio", "codec_name": "opus"}]}'))
+        self.assertFalse(main.is_already_iphone_compatible(Path("video.mp4")))
+
+    @patch("subprocess.run")
+    def test_rejects_high10_profile(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout=(
+            '{"streams": [{"codec_type": "video", "codec_name": "h264", "codec_tag_string": "avc1", '
+            '"profile": "High 10", "pix_fmt": "yuv420p10le", "width": 1920, "height": 1080}]}'))
+        self.assertFalse(main.is_already_iphone_compatible(Path("video.mp4")))
+
+    @patch("subprocess.run")
+    def test_is_already_iphone_compatible_rejects_odd_dimensions(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout=(
+            '{"streams": [{"codec_type": "video", "codec_name": "h264", "codec_tag_string": "avc1", '
+            '"profile": "High", "pix_fmt": "yuv420p", "width": 719, "height": 1280}]}'))
+        self.assertFalse(main.is_already_iphone_compatible(Path("video.mp4")))
+
+    @patch("subprocess.run")
+    def test_returns_none_when_ffprobe_fails(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stdout="")
+        self.assertIsNone(main.is_already_iphone_compatible(Path("video.mp4")))
+
+    @patch("main.is_already_iphone_compatible", return_value=True)
+    @patch("subprocess.run")
+    def test_fallback_to_source_only_when_strictly_compatible(self, mock_run, mock_compat):
         mock_run.return_value = MagicMock(returncode=1, stderr="transcode failed")
         test_file = Path("dummy.mp4")
-        with patch.object(Path, "exists", return_value=False), \
-             patch.object(Path, "unlink"):
+        with patch.object(Path, "exists", return_value=False), patch.object(Path, "unlink"):
             out_file, success = main.ensure_iphone_compatible(test_file, has_audio=True)
-            self.assertTrue(success)
-            self.assertEqual(out_file, test_file)
+        self.assertTrue(success)
+        self.assertEqual(out_file, test_file)
+
+    @patch("main.is_already_iphone_compatible", return_value=False)
+    @patch("subprocess.run")
+    def test_reports_failure_when_source_incompatible(self, mock_run, mock_compat):
+        mock_run.return_value = MagicMock(returncode=1, stderr="transcode failed")
+        with patch.object(Path, "exists", return_value=False), patch.object(Path, "unlink"):
+            out_file, success = main.ensure_iphone_compatible(Path("dummy.mp4"), has_audio=True)
+        self.assertFalse(success)
 
 
 class AudioTaskTests(unittest.TestCase):

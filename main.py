@@ -376,157 +376,180 @@ def _log_stream_diagnostics(filepath: Path) -> None:
         logger.exception("Не удалось получить диагностику потоков для %s", filepath)
 
 
-def is_already_iphone_compatible(filepath: Path) -> bool:
-    """Проверить, соответствует ли файл базовым требованиям совместимости с iPhone."""
-    if filepath.suffix.lower() not in {".mp4", ".mov", ".m4v"}:
+IPHONE_CONTAINERS = {".mp4", ".mov", ".m4v"}
+# Профили H.264, которые аппаратно декодирует любой iPhone и принимает «Фото».
+IPHONE_H264_PROFILES = {"baseline", "constrained baseline", "main", "high"}
+
+
+def is_already_iphone_compatible(filepath: Path) -> bool | None:
+    """Строгая проверка: сохранится ли файл в галерею iPhone и покажет ли видеоряд.
+
+    Возвращает True/False, либо None, если проверить не удалось (нет ffprobe).
+
+    Сознательно строгая: только H.264 (тег avc1, 8-bit 4:2:0, профили
+    Baseline/Main/High) + AAC в MP4/MOV. HEVC с тегом hev1 (типично для
+    TikTok), Opus, VP9, AV1 и т.п. Telegram на iOS может проиграть внутри
+    приложения, но «Фото» такой файл не сохраняет, а «Файлы» играют только звук.
+    """
+    if filepath.suffix.lower() not in IPHONE_CONTAINERS:
         return False
     try:
         probe = subprocess.run(
             [
                 "ffprobe", "-v", "error",
-                "-show_entries", "stream=codec_type,codec_name,pix_fmt,width,height",
+                "-show_entries",
+                "stream=codec_type,codec_name,codec_tag_string,profile,pix_fmt,width,height"
+                ":stream_disposition=attached_pic",
                 "-of", "json",
                 str(filepath),
             ],
             capture_output=True, text=True, timeout=15,
         )
         if probe.returncode != 0:
-            return _heuristic_iphone_compatible(filepath)
-        data = json.loads(probe.stdout)
-        streams = data.get("streams", [])
-        v_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
-        if not v_stream:
-            return False
-        # Видео H.264 (avc1) или HEVC (H.265)
-        v_codec = (v_stream.get("codec_name") or "").lower()
-        if v_codec not in {"h264", "hevc", "h265", "avc1"}:
-            return False
-        pix_fmt = (v_stream.get("pix_fmt") or "").lower()
-        if pix_fmt and pix_fmt not in {"yuv420p", "yuvj420p", "nv12"}:
-            return False
-        # Чётные размеры кадра для исключения аппаратных артефактов декодера iOS
-        width = v_stream.get("width")
-        height = v_stream.get("height")
-        if width and width % 2 != 0:
-            return False
-        if height and height % 2 != 0:
-            return False
-        # Аудио (если есть) должно поддерживаться iOS
-        a_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
-        if a_stream:
-            a_codec = (a_stream.get("codec_name") or "").lower()
-            if a_codec not in {"aac", "mp3", "opus", "alac", "ac3", "eac3", "flac", "m4a"}:
-                return False
-        return True
+            return None
+        streams = json.loads(probe.stdout).get("streams", [])
     except Exception:
-        return _heuristic_iphone_compatible(filepath)
+        return None
+
+    video_streams = [
+        s for s in streams
+        if s.get("codec_type") == "video"
+        and not (s.get("disposition") or {}).get("attached_pic")
+    ]
+    if len(video_streams) != 1:
+        return False
+    v = video_streams[0]
+    if (v.get("codec_name") or "").lower() != "h264":
+        return False
+    if (v.get("codec_tag_string") or "").lower() != "avc1":
+        return False
+    if (v.get("profile") or "").lower() not in IPHONE_H264_PROFILES:
+        return False
+    if (v.get("pix_fmt") or "").lower() not in {"yuv420p", "yuvj420p"}:
+        return False
+    width, height = v.get("width") or 0, v.get("height") or 0
+    if width <= 0 or height <= 0 or width % 2 or height % 2:
+        return False
+
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+    if len(audio_streams) > 1:
+        return False
+    if audio_streams and (audio_streams[0].get("codec_name") or "").lower() != "aac":
+        return False
+    return True
 
 
-def _heuristic_iphone_compatible(filepath: Path) -> bool:
-    """Если ffprobe недоступен, эвристически проверяем расширение контейнера."""
-    return filepath.suffix.lower() in {".mp4", ".mov", ".m4v"}
-
-
-def ensure_iphone_compatible(filepath: Path, *, has_audio: bool = True) -> tuple[Path, bool]:
-    """Гарантированно привести видео к формату, который играет на iPhone без исключений.
-
-    Если файл уже совместим с iPhone, возвращает его без затратного повторного перекодирования.
-    При необходимости перекодирует в заведомо совместимый профиль:
-    - Видео: H.264 High@4.1, 8-bit (yuv420p), scale max 1280 (четные размеры),
-      постоянный frame rate (CFR), moov atom в начале файла (+faststart).
-    - Аудио: AAC, 44.1 kHz, 128 kbps, сведение в стерео (-ac 2) против пропадания
-      голоса из центрального канала 5.1/7.1, и асинхронный ресэмплинг
-      (-af aresample=async=1000) для предотвращения рассинхрона видео и звука.
-    - Отключение субтитров (-sn) и метаданных (-dn), предотвращающее сбои MP4-муксера.
-    """
-    if is_already_iphone_compatible(filepath):
-        logger.info("Файл %s уже совместим с iPhone — перекодирование пропущено.", filepath.name)
-        return filepath, True
-
-    _log_stream_diagnostics(filepath)
-
-    output_path = filepath.with_name(filepath.stem + "_h264.mp4")
+def _build_iphone_transcode_cmd(
+    src: Path, dst: Path, *, has_audio: bool, max_side: int, preset: str,
+) -> list[str]:
+    """Команда ffmpeg, на выходе которой гарантированно H.264 High@4.1 + AAC в MP4."""
     cmd = [
-        "ffmpeg", "-y", "-i", str(filepath),
-        "-vf", "scale=1280:1280:force_original_aspect_ratio=decrease:force_divisible_by=2",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "ffmpeg", "-y", "-i", str(src),
+        # 0:V (заглавная) — основной видеопоток без обложек-картинок;
+        # 0:a:0? — первая аудиодорожка, если она есть.
+        "-map", "0:V:0",
+    ]
+    if has_audio:
+        cmd += ["-map", "0:a:0?"]
+    cmd += [
+        "-vf",
+        f"scale={max_side}:{max_side}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+        "setsar=1",
+        "-c:v", "libx264", "-preset", preset, "-crf", "23",
         "-profile:v", "high", "-level", "4.1",
         "-pix_fmt", "yuv420p",
+        "-tag:v", "avc1",
         "-fps_mode", "cfr",
         "-threads", FFMPEG_THREADS,
         "-sn", "-dn",
+        "-map_metadata", "-1",
     ]
     if has_audio:
-        cmd.extend([
+        cmd += [
             "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
             "-af", "aresample=async=1000",
-        ])
+        ]
     else:
         cmd.append("-an")
-
-    cmd.extend([
+    cmd += [
         "-fflags", "+genpts",
         "-avoid_negative_ts", "make_zero",
         "-max_muxing_queue_size", "1024",
         "-movflags", "+faststart",
-        str(output_path),
-    ])
+        str(dst),
+    ]
+    return cmd
 
+
+def _run_ffmpeg(cmd: list[str], timeout: int) -> subprocess.CompletedProcess | None:
+    """Запустить ffmpeg (с откатом -fps_mode → -vsync для старых версий)."""
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True, text=True, timeout=TRANSCODE_TIMEOUT_SECONDS,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode != 0 and "fps_mode" in result.stderr:
-            cmd_fallback = [
-                arg if arg != "-fps_mode" else "-vsync"
-                for arg in cmd
-            ]
-            result = subprocess.run(
-                cmd_fallback,
-                capture_output=True, text=True, timeout=TRANSCODE_TIMEOUT_SECONDS,
-            )
+            legacy = ["-vsync" if arg == "-fps_mode" else arg for arg in cmd]
+            result = subprocess.run(legacy, capture_output=True, text=True, timeout=timeout)
+        return result
     except FileNotFoundError:
-        logger.error(
-            "ffmpeg не найден в PATH — перекодировка невозможна ни для одного "
-            "видео. Проверьте, что ffmpeg установлен и доступен процессу бота."
-        )
-        if is_already_iphone_compatible(filepath) or filepath.suffix.lower() in {".mp4", ".mov", ".m4v"}:
-            logger.info("Исходный файл %s отправляется как совместимый.", filepath.name)
-            return filepath, True
-        return filepath, False
+        logger.error("ffmpeg не найден в PATH — перекодировка невозможна.")
     except subprocess.TimeoutExpired:
-        logger.error(
-            "Перекодировка %s превысила таймаут %sс; отправляю как есть.",
-            filepath, TRANSCODE_TIMEOUT_SECONDS,
-        )
-        if is_already_iphone_compatible(filepath) or filepath.suffix.lower() in {".mp4", ".mov", ".m4v"}:
-            return filepath, True
-        return filepath, False
+        logger.error("ffmpeg превысил таймаут %sс.", timeout)
+    return None
 
-    if result.returncode != 0:
-        logger.error(
-            "ffmpeg вернул код %s при перекодировке %s.\nSTDERR:\n%s",
-            result.returncode, filepath, result.stderr[-4000:],
-        )
-        output_path.unlink(missing_ok=True)
-        if is_already_iphone_compatible(filepath) or filepath.suffix.lower() in {".mp4", ".mov", ".m4v"}:
-            logger.info("Несмотря на сбой перекодировки, файл %s совместим с iPhone.", filepath.name)
-            return filepath, True
-        return filepath, False
 
-    if not output_path.exists() or output_path.stat().st_size == 0:
-        logger.error(
-            "ffmpeg завершился с кодом 0, но выходной файл %s отсутствует или "
-            "пуст для %s.\nSTDERR:\n%s",
-            output_path, filepath, result.stderr[-4000:],
-        )
-        if is_already_iphone_compatible(filepath) or filepath.suffix.lower() in {".mp4", ".mov", ".m4v"}:
-            return filepath, True
-        return filepath, False
+def ensure_iphone_compatible(filepath: Path, *, has_audio: bool = True) -> tuple[Path, bool]:
+    """Привести видео к формату, который играет и сохраняется в галерею на iPhone.
 
-    filepath.unlink(missing_ok=True)
-    return output_path, True
+    Ролик ВСЕГДА перекодируется в H.264 High@4.1 / yuv420p / CFR / AAC stereo /
+    faststart: источники отдают HEVC, VP9, AV1, Opus, VFR, fragmented MP4 и т.д.,
+    и угадать всё заранее невозможно — поэтому никаких «пропусков» по эвристике.
+
+    Порядок попыток:
+      1. до 1280px по большей стороне, preset veryfast;
+      2. если не вышло (OOM/таймаут/ошибка) — до 854px, preset ultrafast;
+      3. только если обе попытки не удались, а исходник строго совместим
+         (H.264 avc1 + AAC), отправляем его как есть.
+    Результат каждой попытки проверяется ffprobe — файл без видеоряда не пройдёт.
+    Возвращает (путь, гарантирована_ли_совместимость).
+    """
+    _log_stream_diagnostics(filepath)
+    output_path = filepath.with_name(filepath.stem + "_iphone.mp4")
+
+    attempts = (
+        {"max_side": 1280, "preset": "veryfast"},
+        {"max_side": 854, "preset": "ultrafast"},
+    )
+    for number, params in enumerate(attempts, start=1):
+        cmd = _build_iphone_transcode_cmd(filepath, output_path, has_audio=has_audio, **params)
+        result = _run_ffmpeg(cmd, TRANSCODE_TIMEOUT_SECONDS)
+        if result is None or result.returncode != 0:
+            if result is not None:
+                logger.error(
+                    "Попытка %s перекодировки %s: ffmpeg вернул код %s.\nSTDERR:\n%s",
+                    number, filepath.name, result.returncode, result.stderr[-4000:],
+                )
+            output_path.unlink(missing_ok=True)
+            if result is None and not check_ffmpeg_installed():
+                break  # без ffmpeg повторять бессмысленно
+            continue
+
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            logger.error("Попытка %s: ffmpeg не создал выходной файл для %s.", number, filepath.name)
+            output_path.unlink(missing_ok=True)
+            continue
+
+        verdict = is_already_iphone_compatible(output_path)
+        if verdict is False:
+            logger.error("Попытка %s: результат перекодировки %s не прошёл проверку.", number, filepath.name)
+            output_path.unlink(missing_ok=True)
+            continue
+
+        filepath.unlink(missing_ok=True)
+        return output_path, True
+
+    if is_already_iphone_compatible(filepath) is True:
+        logger.warning("Перекодировка не удалась, но исходник %s строго совместим — отправляю его.", filepath.name)
+        return filepath, True
+    return filepath, False
 
 
 def get_video_metadata(filepath: Path) -> dict:
@@ -979,9 +1002,15 @@ def compress_to_fit(filepath: Path, target_bytes: int, *, has_audio: bool = True
     output_path = filepath.with_name(filepath.stem + "_compressed.mp4")
     cmd = [
         "ffmpeg", "-y", "-i", str(filepath),
-        "-vf", "scale=1280:1280:force_original_aspect_ratio=decrease:force_divisible_by=2",
+        "-map", "0:V:0",
+    ]
+    if has_audio:
+        cmd += ["-map", "0:a:0?"]
+    cmd += [
+        "-vf", "scale=1280:1280:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1",
         "-c:v", "libx264", "-threads", FFMPEG_THREADS, "-preset", "veryfast",
         "-profile:v", "high", "-level", "4.1", "-pix_fmt", "yuv420p",
+        "-tag:v", "avc1",
         "-fps_mode", "cfr",
         "-b:v", f"{video_bitrate_kbps}k",
         "-maxrate", f"{video_bitrate_kbps}k",
@@ -1026,6 +1055,10 @@ def compress_to_fit(filepath: Path, target_bytes: int, *, has_audio: bool = True
         return filepath, False
 
     if not output_path.exists() or output_path.stat().st_size == 0:
+        return filepath, False
+    if is_already_iphone_compatible(output_path) is False:
+        logger.error("Сжатый файл %s не прошёл проверку совместимости с iPhone.", output_path.name)
+        output_path.unlink(missing_ok=True)
         return filepath, False
 
     filepath.unlink(missing_ok=True)
@@ -1081,6 +1114,9 @@ async def run_download_and_send(status_msg: Message, url: str) -> None:
                 size = filepath.stat().st_size
 
             has_audio = file_has_audio_stream(filepath)
+            # Предупреждение зависит только от реальной проверки отправляемого файла.
+            verdict = is_already_iphone_compatible(filepath)
+            iphone_ok = transcode_ok if verdict is None else verdict
 
         if size <= TELEGRAM_SEND_LIMIT_BYTES:
             await status_msg.edit_text("📤 Отправляю видео в Telegram...")
@@ -1088,7 +1124,7 @@ async def run_download_and_send(status_msg: Message, url: str) -> None:
             if title and title != "Видео":
                 safe_title = title.strip()[:300]
                 notes.append(f"🎬 {safe_title}")
-            if filepath.suffix.lower() not in {".mp4", ".mov", ".m4v"} and not transcode_ok:
+            if not iphone_ok:
                 notes.append(
                     "⚠️ Не удалось гарантированно оптимизировать формат для iPhone "
                     "(подробности в логах сервера) — на iPhone видео может воспроизводиться "
